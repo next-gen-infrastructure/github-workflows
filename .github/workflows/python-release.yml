@@ -1,0 +1,136 @@
+name: Python release
+
+# Cuts a final vX.Y.Z release from main: validates the version, requires org team membership,
+# tags, builds the wheel and publishes a GitHub Release.
+#
+# Needs the README's "Release convention": the package version comes from git tags (hatch-vcs).
+#
+# The caller owns the trigger (workflow_dispatch with a `version` input), the `concurrency`
+# group and the test gate: a local `./` workflow path would resolve in the caller's checkout, so
+# run `uses: ./.github/workflows/test.yml` in a job this one `needs`.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+        description: Final version without the v, e.g. 0.1.0. Run from main.
+      release-team:
+        type: string
+        default: release-managers
+        description: Org team whose members may cut a final release
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label
+    secrets:
+      RELEASE_APP_ID:
+        required: true
+      RELEASE_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      VERSION: ${{ inputs.version }}
+      REF: ${{ github.ref_name }}
+      ACTOR: ${{ github.actor }}
+      OWNER: ${{ github.repository_owner }}
+      RELEASE_TEAM: ${{ inputs.release-team }}
+    steps:
+      - name: Validate version and branch
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be X.Y.Z, got $VERSION"; exit 1; }
+          [[ "$REF" == "main" ]] || { echo "final releases are cut from main, not $REF"; exit 1; }
+
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      # Team membership is an organization resource: the token above is scoped to this repository,
+      # this one to the organization with Members: read only. Minting it fails with a clear error
+      # when the App lacks the organization permission Members: read.
+      - uses: actions/create-github-app-token@v3
+        id: org-reader
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-members: read
+
+      - name: Require release team membership
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.org-reader.outputs.token }}
+          script: |
+            const { OWNER: org, RELEASE_TEAM: team_slug, ACTOR: username } = process.env;
+            try {
+              const { data } = await github.rest.teams.getMembershipForUserInOrg({ org, team_slug, username });
+              if (data.state !== 'active') core.setFailed(`${username} is not an active member of ${team_slug}`);
+            } catch (err) {
+              // Any other error (team missing, token lacks Members: read) fails with the API message.
+              if (err.status !== 404) throw err;
+              core.setFailed(`${username} is not a member of ${org}/${team_slug}`);
+            }
+
+      # Credentials stay: the job pushes the tag with them and uploads no artifacts.
+      - uses: actions/checkout@v7 # zizmor: ignore[artipacked]
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Refuse an existing or lower version
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "tag v$VERSION already exists"; exit 1
+          fi
+          last=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -n "$last" ] && [ "$(printf '%s\n%s\n' "${last#v}" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            echo "$VERSION is lower than the latest release $last"; exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Tag locally so hatch-vcs derives the version, then build
+        run: |
+          set -euo pipefail
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          uv build
+          compgen -G "dist/*-$VERSION-*.whl" || { echo "wheel does not carry $VERSION"; ls dist; exit 1; }
+
+      - name: Push the tag as the App
+        run: git push origin "refs/tags/v$VERSION"
+
+      # Draft first, so a failed upload leaves a draft rather than a release with missing files.
+      - name: Publish the GitHub Release
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const tag = `v${process.env.VERSION}`;
+            const { owner, repo } = context.repo;
+            const { data: release } = await github.rest.repos.createRelease({
+              owner, repo, tag_name: tag, name: tag, draft: true, generate_release_notes: true,
+            });
+            for (const name of fs.readdirSync('dist')) {
+              const data = fs.readFileSync(`dist/${name}`);
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name, data,
+                headers: { 'content-type': 'application/octet-stream', 'content-length': data.length },
+              });
+              core.info(`uploaded ${name}`);
+            }
+            await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, draft: false });
+            core.info(`published ${release.html_url}`);

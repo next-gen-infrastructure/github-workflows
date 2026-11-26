@@ -1,0 +1,9 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # First-party actions stay on major tags (docs/review.md R6).
+        "actions/*": ref-pin
+        # Own composite actions on the moving major tag, bumped by release-please (docs/review.md V1).
+        "next-gen-infrastructure/github-workflows/*": ref-pin
+        "*": hash-pin

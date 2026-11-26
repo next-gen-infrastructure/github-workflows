@@ -1,0 +1,91 @@
+name: Python lint (changed files)
+
+# Pull requests only. For each changed .py file, the number of ruff findings must not rise versus
+# the target branch: fix what the PR adds, not the file's backlog. Ruff runs through uvx, so no
+# `uv sync` and no sibling clone are needed; it still reads the repo's own ruff configuration.
+# Base and head are measured with the same, pinned ruff (the repo's lock by default), so a ruff
+# release cannot change the result.
+
+on:
+  workflow_call:
+    inputs:
+      ruff-version:
+        type: string
+        default: lock
+        description: >
+          `lock` (also when empty) reads the version from the repo's uv.lock, so the lint cannot
+          drift from the project's pin. A repo without ruff in uv.lock passes a version, e.g. 0.17.6.
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history fetches every origin/* branch, so the base needs no later (authenticated) fetch.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Lint changed files
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          RUFF_VERSION: ${{ inputs.ruff-version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RUFF_VERSION" ] || [ "$RUFF_VERSION" = "lock" ]; then
+            RUFF_VERSION="$(awk '/^name = "ruff"$/ {getline; split($0, a, "\""); print a[2]; exit}' uv.lock 2>/dev/null || true)"
+            [ -n "$RUFF_VERSION" ] || { echo "::error::uv.lock has no ruff; pass ruff-version, e.g. 0.17.6"; exit 1; }
+            echo "ruff $RUFF_VERSION from uv.lock"
+          fi
+          ruff=(uvx "ruff@$RUFF_VERSION")
+
+          base="origin/$BASE_REF"
+          mapfile -t changed < <(git diff --name-only "$base...HEAD" -- '*.py')
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "no Python files changed"
+            exit 0
+          fi
+          printf '%s\n' "${changed[@]}"
+          existing=()
+          for f in "${changed[@]}"; do [ -f "$f" ] && existing+=("$f"); done
+          if [ ${#existing[@]} -eq 0 ]; then
+            echo "all changed Python files were deleted"
+            exit 0
+          fi
+
+          count_findings() {
+            grep -cE ':[0-9]+:[0-9]+:' <<<"${1:-}" || true
+          }
+
+          regressed=0
+          for f in "${existing[@]}"; do
+            head_out=$("${ruff[@]}" check --output-format=concise "$f" 2>/dev/null || true)
+            head_n=$(count_findings "$head_out")
+            if git cat-file -e "$base:$f" 2>/dev/null; then
+              base_n=$(count_findings "$(git show "$base:$f" | "${ruff[@]}" check --output-format=concise --stdin-filename "$f" - 2>/dev/null || true)")
+            else
+              base_n=0
+            fi
+            if [ "$head_n" -gt "$base_n" ]; then
+              echo "::error file=$f::ruff findings rose from $base_n to $head_n in this file"
+              echo "$head_out"
+              regressed=1
+            else
+              echo "ok  $f  ($head_n findings, base $base_n)"
+            fi
+          done
+          if [ "$regressed" -ne 0 ]; then
+            echo "::error::lint regressed - fix the findings this PR added, not the file's backlog"
+            exit 1
+          fi
+          echo "no changed file gained a ruff finding"

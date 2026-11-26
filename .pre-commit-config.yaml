@@ -1,0 +1,33 @@
+---
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+      - id: check-yaml
+      - id: detect-aws-credentials
+        args: [--allow-missing-credentials]
+  # The PyPI build of actionlint, so shellcheck comes with it: CI runners have shellcheck, and
+  # without it locally actionlint skips those checks.
+  - repo: https://github.com/Mateusz-Grzelinski/actionlint-py
+    rev: v1.7.12.25
+    hooks:
+      - id: actionlint
+        additional_dependencies: [shellcheck-py==0.11.0.1]
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.32.0
+    hooks:
+      - id: zizmor
+        args: [ --fix=safe ]
+  - repo: local
+    hooks:
+      - id: ghcr-cleanup-test
+        name: ghcr-cleanup unit tests
+        language: system
+        # The file, not the directory: Node 24 does not search a directory argument for tests.
+        entry: node --test .github/actions/ghcr-cleanup/cleanup-ghcr.test.js
+        files: ^\.github/actions/ghcr-cleanup/
+        pass_filenames: false

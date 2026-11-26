@@ -1,0 +1,250 @@
+name: Python tests
+
+# The caller owns the triggers and the `concurrency` group.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label. `uv sync` over a large sibling closure needs about 8Gi of memory.
+      pytest-args:
+        type: string
+        default: tests/unit
+        description: >
+          Arguments for `uv run pytest`, split on spaces (no quoting), e.g.
+          `tests --ignore=tests/integration`. Leave out `--junitxml`: the workflow sets its own
+          and counts results from it.
+      uv-sync-args:
+        type: string
+        default: --frozen --all-extras
+        description: >
+          Arguments for `uv sync`. --all-extras is a workaround for modules that still declare
+          pytest under optional-dependencies instead of dependency-groups (OSI-3181).
+      python-version:
+        type: string
+        default: ""
+        description: Python for uv, e.g. 3.12. Empty lets uv choose.
+      min-passed:
+        type: number
+        default: 0
+        description: Fail when fewer tests passed, so a suite that silently stopped running is red. 0 disables it.
+      compare-with-base:
+        type: boolean
+        default: false
+        description: >
+          Pull requests only: measure the target branch in this run and fail only on tests that
+          fail here and pass there. Without it, any failing test fails the run.
+      free-disk-space:
+        type: boolean
+        default: false
+        description: Free runner disk first, for large sibling closures
+      artifact-paths:
+        type: string
+        default: ""
+        description: Newline-separated paths uploaded as the `python-test-artifacts` artifact, even when the tests fail (logs, coverage)
+      timeout-minutes:
+        type: number
+        default: 360
+        description: Job timeout (360 is GitHub's default)
+      persist-credentials:
+        type: boolean
+        default: false
+        description: Keep the checkout token in git config. Set true only when the tests push.
+      base-ref:
+        type: string
+        default: ""
+        description: Branch to clone siblings from. Empty uses the PR base, or dev on a push.
+      sibling-prefix:
+        type: string
+        default: ""
+        description: Clone only path dependencies named `../<prefix>*`. Empty clones every `../<name>` dependency.
+      pre-test-script:
+        type: string
+        default: ""
+        description: >
+          Path in the checkout to a bash script run after `uv sync` and before the tests, with
+          the siblings cloned and git credentials for private repos set. Fails the job if it exits non-zero.
+    secrets:
+      DEPS_READER_APP_ID:
+        required: true
+      DEPS_READER_PRIVATE_KEY:
+        required: true
+    outputs:
+      passed:
+        description: Number of tests that passed on this branch
+        value: ${{ jobs.test.outputs.passed }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      passed: ${{ steps.tests.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Comparing with the base needs its history. Strings: a bare 0 is falsy and always gave 1.
+          fetch-depth: ${{ inputs.compare-with-base && '0' || '1' }}
+          persist-credentials: ${{ inputs.persist-credentials }}
+
+      - name: Free disk space
+        if: inputs.free-disk-space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          android: true
+          swap-storage: true
+          dotnet: false
+          haskell: false
+          large-packages: false
+          docker-images: false
+
+      - name: Read token for private sibling repos
+        id: deps-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DEPS_READER_APP_ID }}
+          private-key: ${{ secrets.DEPS_READER_PRIVATE_KEY }}
+          # Owner-wide: the sibling closure and uv's git sources are only known at run time.
+          owner: ${{ github.repository_owner }} # zizmor: ignore[github-app]
+          permission-contents: read
+
+      # Not `./`: a local path would resolve in the caller's checkout. release-please bumps the major.
+      - uses: next-gen-infrastructure/github-workflows/.github/actions/clone-siblings@v1 # x-release-please-major
+        with:
+          token: ${{ steps.deps-token.outputs.token }}
+          base-ref: ${{ inputs.base-ref || github.base_ref || 'dev' }}
+          sibling-prefix: ${{ inputs.sibling-prefix }}
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Pin Python
+        if: inputs.python-version != ''
+        env:
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: echo "UV_PYTHON=$PYTHON_VERSION" >> "$GITHUB_ENV"
+
+      # For every later step: uv sync, the pre-test script and the tests fetch private git sources.
+      - name: Git credentials for private repos
+        env:
+          TOKEN: ${{ steps.deps-token.outputs.token }}
+        run: |
+          {
+            echo "GH_TOKEN=$TOKEN"
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
+            # shellcheck disable=SC2016 # $GH_TOKEN stays literal: git expands it when it runs the helper.
+            echo 'GIT_CONFIG_VALUE_0=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        env:
+          UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
+        run: |
+          read -ra sync_args <<<"$UV_SYNC_ARGS"
+          uv sync "${sync_args[@]}"
+
+      - name: Pre-test script
+        if: inputs.pre-test-script != ''
+        env:
+          SCRIPT: ${{ inputs.pre-test-script }}
+        run: |
+          set -euo pipefail
+          [ -f "$SCRIPT" ] || { printf '::error::pre-test-script %q not found\n' "$SCRIPT"; exit 1; }
+          bash "$SCRIPT"
+
+      # No continue-on-error: a red repo must be red. With compare-with-base the only tolerated
+      # failures are the ones the target branch has too.
+      - name: Tests
+        id: tests
+        env:
+          UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
+          PYTEST_ARGS: ${{ inputs.pytest-args }}
+          MIN_PASSED: ${{ inputs.min-passed }}
+          COMPARE: ${{ inputs.compare-with-base && github.event_name == 'pull_request' }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -uo pipefail
+          # The two inputs split on spaces, as documented.
+          read -ra sync_args <<<"$UV_SYNC_ARGS"
+          read -ra pytest_args <<<"$PYTEST_ARGS"
+          out="$RUNNER_TEMP/pytest"
+          mkdir -p "$out"
+          extra=()
+          [ "$COMPARE" = "true" ] && extra=(-q --continue-on-collection-errors)
+
+          # Reads pytest's JUnit XML: prints the passed count, writes the failed ids (sorted) to $2.
+          # No file (pytest died before writing it) counts as 0 passed and no failures.
+          junit_summary() {
+            if [ ! -f "$1" ]; then : > "$2"; echo 0; return; fi
+            uv run --no-project --quiet python - "$1" "$2" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          failed, passed = set(), 0
+          for case in ET.parse(sys.argv[1]).getroot().iter("testcase"):
+              if case.find("failure") is not None or case.find("error") is not None:
+                  # A collection error has no classname.
+                  failed.add("::".join(filter(None, (case.get("classname"), case.get("name")))))
+              elif case.find("skipped") is None:
+                  passed += 1
+          with open(sys.argv[2], "w") as f:
+              f.writelines(f"{i}\n" for i in sorted(failed))
+          print(passed)
+          PY
+          }
+
+          if [ "$COMPARE" = "true" ]; then
+            head_sha=$(git rev-parse HEAD)
+            git checkout -qf "origin/$BASE_REF"
+            uv sync "${sync_args[@]}"
+            uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/base.xml" \
+              > "$out/base.log" 2>&1 || true
+            base_passed=$(junit_summary "$out/base.xml" "$out/base_failed.txt")
+            echo "target branch: $(wc -l < "$out/base_failed.txt") failing, $base_passed passing tests"
+            git checkout -qf "$head_sha"
+            uv sync "${sync_args[@]}"
+          fi
+
+          uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/head.xml" 2>&1 \
+            | tee "$out/head.log"
+          rc=${PIPESTATUS[0]}
+
+          passed=$(junit_summary "$out/head.xml" "$out/head_failed.txt")
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          if [ "$passed" -lt "$MIN_PASSED" ]; then
+            echo "::error::only $passed tests passed (expected at least $MIN_PASSED) - the suite did not run"
+            exit 1
+          fi
+
+          if [ "$COMPARE" != "true" ]; then
+            exit "$rc"
+          fi
+
+          # C collation, to match Python's sorted().
+          LC_ALL=C comm -23 "$out/head_failed.txt" "$out/base_failed.txt" > "$out/new_failures.txt"
+          LC_ALL=C comm -13 "$out/head_failed.txt" "$out/base_failed.txt" > "$out/fixed.txt"
+          new_n=$(wc -l < "$out/new_failures.txt")
+          fixed_n=$(wc -l < "$out/fixed.txt")
+          echo "::notice::$new_n newly failing, $fixed_n newly passing, against $BASE_REF measured in this run"
+          if [ "$fixed_n" -gt 0 ]; then
+            echo "newly PASSING (fixed by this PR):"; cat "$out/fixed.txt"
+          fi
+          if [ "$new_n" -gt 0 ]; then
+            echo "newly FAILING (broken by this PR):"; cat "$out/new_failures.txt"
+            echo "::error::$new_n test(s) fail on this branch and pass on $BASE_REF"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        if: always() && inputs.artifact-paths != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-test-artifacts
+          path: ${{ inputs.artifact-paths }}
+          retention-days: 14
+          if-no-files-found: warn

@@ -1,0 +1,314 @@
+name: Docker build
+
+# Builds an image and pushes it to ghcr.io/<owner>/<image-name>.
+#
+#   push / dispatch on main   latest, sha-<sha>
+#   push / dispatch on dev    dev-<sha>
+#   pull request              pr-<n>, built but not pushed
+#
+# After a repository_dispatch from a dependency, `-<dependency sha>` is appended to the sha tags.
+# The branch comes from client_payload.branch (dispatch) or the ref; anything but dev or main fails.
+#
+# The caller owns the triggers, `concurrency`, the test gate and, for pull requests, the decision
+# whether a build is needed at all (see go-test's `image_inputs_changed`).
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+        description: Image name under ghcr.io/<owner>/, e.g. my-app
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label.
+      timeout-minutes:
+        type: number
+        default: 30
+      dependency-repos:
+        type: string
+        default: ""
+        description: >
+          Newline-separated repos cloned into the build context at the build branch (a Dockerfile
+          COPYs them). Their .git is removed so no token stays in the context.
+      dependency-repos-file:
+        type: string
+        default: ""
+        description: >
+          Path in the checkout to a file of repos, one per line (blank lines and # comments are
+          ignored), merged with dependency-repos. Lets other workflows read the same list.
+      context:
+        type: string
+        default: .
+        description: Docker build context
+      file:
+        type: string
+        default: Dockerfile
+        description: Dockerfile path
+      build-args:
+        type: string
+        default: ""
+        description: Newline-separated KEY=VALUE build arguments. Not for secrets, use BUILD_ENV_FILE.
+      sbom:
+        type: boolean
+        default: false
+        description: Attach an SBOM attestation to the pushed image
+      cleanup:
+        type: boolean
+        default: false
+        description: >
+          After a successful push, delete old versions of this image's package (same rule as
+          ghcr-cleanup: keep the newest main and dev versions). A cleanup failure never fails the build.
+      keep-main:
+        type: number
+        default: 10
+        description: Main versions to keep when cleanup is on; -1 keeps all
+      keep-dev:
+        type: number
+        default: 5
+        description: Dev versions to keep when cleanup is on; -1 keeps all
+      cleanup-dry-run:
+        type: boolean
+        default: false
+        description: Only report what the cleanup would delete
+      cleanup-runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label for the cleanup job
+      mirror-git-sources:
+        type: boolean
+        default: false
+        description: Mirror the git sources pinned in uv.lock and expose them as the `git-mirrors` build context
+      free-disk-space:
+        type: boolean
+        default: false
+        description: Free runner disk before building, for very large images
+      environment:
+        type: string
+        default: ""
+        description: GitHub environment for the job, when BUILD_ENV_FILE is stored there
+    secrets:
+      DEPS_READER_APP_ID:
+        required: false
+        description: Needed with dependency-repos, dependency-repos-file or mirror-git-sources
+      DEPS_READER_PRIVATE_KEY:
+        required: false
+      BUILD_ENV_FILE:
+        required: false
+        description: Contents of a .env file, passed to the build as the secret file `env`, written outside the build context
+    outputs:
+      digest:
+        description: Digest of the pushed image
+        value: ${{ jobs.build.outputs.digest }}
+      tags:
+        description: Image tags
+        value: ${{ jobs.build.outputs.tags }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # `secrets` is not available in step `if:`, a job env flag is. The value itself stays step-scoped.
+      HAS_BUILD_ENV: ${{ secrets.BUILD_ENV_FILE != '' }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+      pushed: ${{ steps.target.outputs.mode != 'pr' }}
+    steps:
+      - name: Get build target
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            # Dependencies come from the PR's target branch, or dev for any other base.
+            branch="$BASE_REF"; [[ "$branch" == "main" ]] || branch=dev
+            mode="pr"
+          else
+            if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+              branch="${PAYLOAD_BRANCH:-dev}"
+            else
+              branch="$REF_NAME"
+            fi
+            case "$branch" in
+              dev|main) mode="$branch" ;;
+              *) printf '::error::refusing build environment %q\n' "$branch"; exit 1 ;;
+            esac
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          # Empty on a pull request: the default merge ref.
+          ref: ${{ steps.target.outputs.mode != 'pr' && steps.target.outputs.branch || '' }}
+          persist-credentials: false
+
+      - name: Free disk space
+        if: inputs.free-disk-space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          android: true
+          swap-storage: true
+          dotnet: false
+          haskell: false
+          large-packages: false
+          docker-images: false
+
+      - name: Read token for private dependency repos
+        id: deps-token
+        if: inputs.dependency-repos != '' || inputs.dependency-repos-file != '' || inputs.mirror-git-sources
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DEPS_READER_APP_ID }}
+          private-key: ${{ secrets.DEPS_READER_PRIVATE_KEY }}
+          # Owner-wide: the repos come from dependency-repos(-file) and uv.lock at run time.
+          owner: ${{ github.repository_owner }} # zizmor: ignore[github-app]
+          permission-contents: read
+
+      # No fallback to another branch: a main build must not silently bake in dev code.
+      - name: Clone dependencies into the build context
+        if: inputs.dependency-repos != '' || inputs.dependency-repos-file != ''
+        env:
+          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+          OWNER: ${{ github.repository_owner }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          REPOS: ${{ inputs.dependency-repos }}
+          REPOS_FILE: ${{ inputs.dependency-repos-file }}
+          SOURCE: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_repo || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SOURCE" ] && [[ ! "$SOURCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            printf '::error::refusing source_repo %q\n' "$SOURCE"; exit 1
+          fi
+          from_file=""
+          if [ -n "$REPOS_FILE" ]; then
+            [ -f "$REPOS_FILE" ] || { printf '::error::dependency-repos-file %q not found at the build branch\n' "$REPOS_FILE"; exit 1; }
+            from_file="$(cat "$REPOS_FILE")"
+          fi
+          # Inline and file lists merged: comments and blanks dropped, duplicates removed.
+          repos="$(printf '%s\n%s\n' "$REPOS" "$from_file" | sed -E 's/#.*//; s/[[:space:]]+//g' | sed '/^$/d' | sort -u)"
+          if [ -z "$repos" ]; then
+            echo "::error::no dependency repos resolved"; exit 1
+          fi
+          while IFS= read -r repo; do
+            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              printf '::error::refusing dependency repo %q\n' "$repo"; exit 1
+            fi
+            git clone --depth 1 -b "$BRANCH" "https://github.com/${OWNER}/${repo}.git" "$repo"
+            if [ "$repo" = "$SOURCE" ]; then
+              echo "SUBMODULE_SHA=-$(git -C "$repo" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+            fi
+            rm -rf "$repo/.git"
+          done <<< "$repos"
+
+      - name: Mirror the git sources uv.lock pins
+        if: inputs.mirror-git-sources
+        env:
+          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+        run: |
+          mkdir -p "$RUNNER_TEMP/git-mirrors"
+          { grep -oE '^source = \{ git = "https://github.com/[^?"]+' uv.lock || true; } |
+            sed 's#.*github.com/##' | sort -u |
+            while read -r repo; do
+              git clone -q --bare "https://github.com/$repo" "$RUNNER_TEMP/git-mirrors/$repo"
+            done
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          # The sha comes from the checked-out commit: on repository_dispatch, github.sha is the
+          # default branch's head, not the dispatched branch that was built.
+          context: git
+          images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}
+          tags: |
+            type=raw,value=latest,enable=${{ steps.target.outputs.mode == 'main' }}
+            type=sha,format=short,suffix=${{ env.SUBMODULE_SHA }},enable=${{ steps.target.outputs.mode == 'main' }}
+            type=sha,format=short,prefix=dev-,suffix=${{ env.SUBMODULE_SHA }},enable=${{ steps.target.outputs.mode == 'dev' }}
+            type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ steps.target.outputs.mode == 'pr' }}
+
+      # Outside the build context, so a `COPY . .` cannot bake it into a layer. The runner wipes
+      # RUNNER_TEMP after the job.
+      - name: Write the build secret file
+        if: env.HAS_BUILD_ENV == 'true'
+        env:
+          BUILD_ENV_FILE: ${{ secrets.BUILD_ENV_FILE }}
+        run: printf '%s\n' "$BUILD_ENV_FILE" > "$RUNNER_TEMP/build.env"
+
+      - name: Build & push image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          build-args: ${{ inputs.build-args }}
+          platforms: linux/amd64
+          push: ${{ steps.target.outputs.mode != 'pr' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-contexts: ${{ inputs.mirror-git-sources && format('git-mirrors={0}/git-mirrors', runner.temp) || '' }}
+          secret-files: ${{ env.HAS_BUILD_ENV == 'true' && format('env={0}/build.env', runner.temp) || '' }}
+          sbom: ${{ inputs.sbom }}
+          # GitHub Actions cache, one scope per image. 10 GB per repo, oldest entries evicted first.
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          cache-to: type=gha,scope=${{ inputs.image-name }},mode=max
+
+      - name: Summary
+        if: steps.target.outputs.mode != 'pr'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Image pushed"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo "Digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Runs only after the image was pushed. continue-on-error: a cleanup problem must not turn a
+  # published build red.
+  cleanup:
+    needs: build
+    if: needs.build.outputs.pushed == 'true' && inputs.cleanup
+    runs-on: ${{ inputs.cleanup-runs-on }}
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Not `./`: a local path would resolve in the caller's checkout. release-please bumps the major.
+      - uses: next-gen-infrastructure/github-workflows/.github/actions/ghcr-cleanup@v1 # x-release-please-major
+        with:
+          package: ${{ inputs.image-name }}
+          keep-main: ${{ inputs.keep-main }}
+          keep-dev: ${{ inputs.keep-dev }}
+          dry-run: ${{ inputs.cleanup-dry-run }}

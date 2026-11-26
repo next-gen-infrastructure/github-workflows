@@ -1,0 +1,69 @@
+name: Trigger downstream build
+
+on:
+  workflow_call:
+    inputs:
+      repositories:
+        type: string
+        required: true
+        description: Repositories to trigger downstream build, e.g. '["repo1", "repo2"]'
+      event-type:
+        type: string
+        default: python-submodule-update
+        description: repository_dispatch event type the downstream workflows listen for
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label. The job is one API call per repo, so the smallest pool with the highest concurrency fits.
+    secrets:
+      TRIGGER_DOWNSTREAM_APP_ID:
+        required: true
+      TRIGGER_DOWNSTREAM_PRIVATE_KEY:
+        required: true
+
+# The dispatch uses the App token only.
+permissions: {}
+
+jobs:
+  trigger:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      # One token for all targets. Minting fails when the App is not installed on one of them.
+      - id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.TRIGGER_DOWNSTREAM_APP_ID }}
+          private-key: ${{ secrets.TRIGGER_DOWNSTREAM_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ join(fromJson(inputs.repositories), ',') }}
+          permission-contents: write # repository_dispatch
+
+      # A failed dispatch does not stop the others; the step fails at the end, naming them.
+      - name: Trigger downstream builds
+        uses: actions/github-script@v9
+        env:
+          TARGETS: ${{ inputs.repositories }}
+          EVENT_TYPE: ${{ inputs.event-type }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          # language=js
+          script: |
+            const failed = [];
+            for (const target of JSON.parse(process.env.TARGETS)) {
+              try {
+                await github.rest.repos.createDispatchEvent({
+                  owner: context.repo.owner,
+                  repo: target,
+                  event_type: process.env.EVENT_TYPE,
+                  client_payload: {
+                    source_repo: context.repo.repo,
+                    branch: context.ref.replace('refs/heads/', ''),
+                  },
+                });
+                core.info(`Dispatched to ${target}`);
+              } catch (err) {
+                core.error(`${target}: ${err.message}`);
+                failed.push(target);
+              }
+            }
+            if (failed.length) core.setFailed(`dispatch failed for ${failed.join(', ')}`);

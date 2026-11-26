@@ -1,0 +1,90 @@
+name: Node tests
+
+# Two parallel jobs, as in a typical front-end repo: type check with lint and format (one install), and
+# unit tests. The repo needs a package-lock.json and the package.json scripts `lint`,
+# `format:check` and `test:run`. The caller owns the triggers and the `concurrency` group.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '20'
+        description: Node version for both jobs
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label for type check and lint
+      test-runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label for the unit tests, which are the heavy job
+      codecov:
+        type: boolean
+        default: false
+        description: >
+          Upload ./coverage/coverage-final.json to Codecov with the CODECOV_TOKEN secret (required
+          for private repos); a failed upload does not fail the run
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Type Check & Lint
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        id: install
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      # Lint and format still run after a failed type check, so one run reports all three.
+      - name: Lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm run lint
+
+      - name: Format check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: npm run format:check
+
+  test:
+    name: Unit Tests
+    runs-on: ${{ inputs.test-runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test:run -- --coverage
+
+      - name: Upload coverage reports
+        if: always() && inputs.codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ./coverage/coverage-final.json
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

@@ -1,0 +1,50 @@
+name: GHCR cleanup
+description: >
+  Keep the newest main (latest / sha-*) and dev (dev-*) versions of a GHCR container package and
+  delete the rest, plus the untagged manifests nothing references. Needs `packages: write`.
+
+inputs:
+  package:
+    description: Container package name, e.g. my-app
+    required: true
+  keep-main:
+    description: Main versions to keep; -1 keeps all
+    default: '10'
+  keep-dev:
+    description: Dev versions to keep; -1 keeps all
+    default: '5'
+  dry-run:
+    description: Only report what would be deleted
+    default: 'false'
+  max-deletes:
+    description: Deletion cap per run (GitHub allows 80 content changes per minute, 500 per hour)
+    default: '400'
+  token:
+    description: Token with packages access
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v9
+      env:
+        GHCR_TOKEN: ${{ inputs.token }}
+        PACKAGE: ${{ inputs.package }}
+        KEEP_MAIN: ${{ inputs.keep-main }}
+        KEEP_DEV: ${{ inputs.keep-dev }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        MAX_DELETES: ${{ inputs.max-deletes }}
+      with:
+        script: |
+          const cleanup = require('${{ github.action_path }}/cleanup-ghcr.js');
+          await cleanup({
+            github,
+            core,
+            owner: context.repo.owner,
+            pkg: process.env.PACKAGE,
+            keepMain: Number(process.env.KEEP_MAIN),
+            keepDev: Number(process.env.KEEP_DEV),
+            maxDeletes: Number(process.env.MAX_DELETES),
+            dryRun: process.env.DRY_RUN === 'true',
+            token: process.env.GHCR_TOKEN,
+          });

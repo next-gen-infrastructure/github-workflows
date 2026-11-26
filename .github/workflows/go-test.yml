@@ -1,0 +1,120 @@
+name: Go tests
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: ubuntu-latest
+        description: Runner label
+      timeout-minutes:
+        type: number
+        default: 30
+      test-timeout:
+        type: string
+        default: 15m
+        description: Value of `go test -timeout`
+      node-version:
+        type: string
+        default: ""
+        description: Install Node when set, for Go tests that shell out to node (e.g. render.mjs)
+      image-inputs-pattern:
+        type: string
+        default: 'Dockerfile|\.dockerignore|go\.mod|go\.sum|\.github/workflows/.*'
+        description: Extended regex matched against whole changed paths; a match sets image_inputs_changed
+      extra-inputs-pattern:
+        type: string
+        default: ""
+        description: A second regex for a second flag, extra_inputs_changed (e.g. what triggers an e2e job). Empty disables it.
+      race:
+        type: boolean
+        default: false
+        description: Run `go test -race`
+      coverage:
+        type: boolean
+        default: false
+        description: Write coverage.out and put the total in the job summary
+      lint:
+        type: boolean
+        default: false
+        description: Run golangci-lint v2.15 (patch releases only), using the repo's own configuration
+    outputs:
+      image_inputs_changed:
+        description: >
+          On a pull request, true when a changed path matches image-inputs-pattern (by default the
+          Dockerfile, go.mod/go.sum or a workflow), so the caller knows to build its image. Empty on push.
+        value: ${{ jobs.test.outputs.image_inputs_changed }}
+      extra_inputs_changed:
+        description: On a pull request, true when a changed path matches extra-inputs-pattern. Empty on push.
+        value: ${{ jobs.test.outputs.extra_inputs_changed }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      image_inputs_changed: ${{ steps.changes.outputs.changed }}
+      extra_inputs_changed: ${{ steps.changes.outputs.extra }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      # On a PR, HEAD is the merge commit and HEAD^1 is the base branch.
+      - name: Detect Dockerfile / go.mod changes
+        id: changes
+        if: github.event_name == 'pull_request'
+        env:
+          IMAGE_PATTERN: ${{ inputs.image-inputs-pattern }}
+          EXTRA_PATTERN: ${{ inputs.extra-inputs-pattern }}
+        run: |
+          files="$(git diff --name-only HEAD^1 HEAD)"
+          if grep -qxE "$IMAGE_PATTERN" <<<"$files"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$EXTRA_PATTERN" ] && grep -qxE "$EXTRA_PATTERN" <<<"$files"; then
+            echo "extra=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "extra=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v7
+        if: inputs.node-version != ''
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build & vet
+        run: go build ./... && go vet ./...
+
+      - name: golangci-lint
+        if: inputs.lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Pinned minor: a new golangci-lint release must not turn a green repo red. Bump by hand.
+          version: v2.15
+
+      - name: Test
+        env:
+          TEST_TIMEOUT: ${{ inputs.test-timeout }}
+          RACE: ${{ inputs.race }}
+          COVERAGE: ${{ inputs.coverage }}
+        run: |
+          set -euo pipefail
+          args=(-count=1)
+          if [ "$RACE" = "true" ]; then args+=(-race); fi
+          if [ "$COVERAGE" = "true" ]; then args+=(-covermode=atomic -coverprofile=coverage.out); fi
+          go test "${args[@]}" ./... -timeout "$TEST_TIMEOUT"
+          if [ "$COVERAGE" = "true" ]; then
+            echo "Go coverage: $(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')" >> "$GITHUB_STEP_SUMMARY"
+          fi

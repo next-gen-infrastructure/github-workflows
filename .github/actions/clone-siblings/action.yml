@@ -1,0 +1,69 @@
+name: Clone sibling packages
+description: >
+  Clone the `../<sibling-prefix>*` path dependencies of this repo next to the workspace. The set is derived
+  from `[tool.uv.sources]` in pyproject.toml, then from each cloned sibling's own pyproject.toml,
+  until nothing new appears. Clones the PR base branch, falling back to dev.
+
+inputs:
+  token:
+    description: Token with read access to the private sibling repos
+    required: true
+  base-ref:
+    description: Branch to clone from; falls back to dev when a sibling lacks it
+    default: dev
+  sibling-prefix:
+    description: Only path dependencies `../<prefix>*` are cloned. Empty clones every `../<name>` dependency.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        # Credential helper, so the token never lands in a sibling's .git/config.
+        GIT_CONFIG_COUNT: 1
+        GIT_CONFIG_KEY_0: credential.https://github.com.helper
+        GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+        BASE_REF: ${{ inputs.base-ref }}
+        PREFIX: ${{ inputs.sibling-prefix }}
+        WORKSPACE: ${{ github.workspace }}
+        OWNER: ${{ github.repository_owner }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! "$PREFIX" =~ ^[A-Za-z0-9._-]*$ || "$PREFIX" == .* ]]; then
+          printf '::error::refusing sibling-prefix %q\n' "$PREFIX"; exit 1
+        fi
+
+        # `|| true`: a closure leaf has no matches and grep exits 1, which is not an error.
+        extract_siblings() {
+          { awk '/^\[tool\.uv\.sources\]/{inside=1; next} /^\[/{inside=0} inside' \
+              "$1/pyproject.toml" 2>/dev/null \
+            | grep -ohE "[\"']\.\./${PREFIX}[A-Za-z0-9][A-Za-z0-9._-]*" | sed -E 's#^.\.\./##' | sort -u; } || true
+        }
+
+        clone_repo() {
+          local repo="$1"
+          local url="https://github.com/${OWNER}/${repo}.git"
+          if ! git clone --depth 1 -b "$BASE_REF" "$url" "$repo" 2>/dev/null; then
+            echo "branch $BASE_REF not in $repo; falling back to dev"
+            git clone --depth 1 -b dev "$url" "$repo"
+          fi
+        }
+
+        cd "$WORKSPACE/.."
+        frontier="$(extract_siblings "$WORKSPACE")"
+        while [ -n "$frontier" ]; do
+          next=""
+          for repo in $frontier; do
+            [ -d "$repo" ] && continue
+            echo "Cloning sibling: $repo"
+            clone_repo "$repo"
+            next="$next $(extract_siblings "$repo")"
+          done
+          frontier="$(printf '%s\n' $next | sed '/^$/d' | sort -u | tr '\n' ' ')"
+        done
+
+        echo "Resolved sibling closure:"
+        find . -maxdepth 1 -type d -name "${PREFIX}*" | sort

@@ -128,21 +128,13 @@ jobs:
           PYTHON_VERSION: ${{ inputs.python-version }}
         run: echo "UV_PYTHON=$PYTHON_VERSION" >> "$GITHUB_ENV"
 
-      # For every later step: uv sync, the pre-test script and the tests fetch private git sources.
-      - name: Git credentials for private repos
-        env:
-          TOKEN: ${{ steps.deps-token.outputs.token }}
-        run: |
-          {
-            echo "GH_TOKEN=$TOKEN"
-            echo "GIT_CONFIG_COUNT=1"
-            echo "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
-            # shellcheck disable=SC2016 # $GH_TOKEN stays literal: git expands it when it runs the helper.
-            echo 'GIT_CONFIG_VALUE_0=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
-          } >> "$GITHUB_ENV"
-
       - name: Install dependencies
         env:
+          # Private git sources. Not exported to later steps: the tests must not see the token.
+          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
           UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
         run: |
           read -ra sync_args <<<"$UV_SYNC_ARGS"
@@ -151,6 +143,11 @@ jobs:
       - name: Pre-test script
         if: inputs.pre-test-script != ''
         env:
+          # Private git sources. Not exported to later steps: the tests must not see the token.
+          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
           SCRIPT: ${{ inputs.pre-test-script }}
         run: |
           set -euo pipefail
@@ -162,6 +159,11 @@ jobs:
       - name: Tests
         id: tests
         env:
+          # Private git sources. Only the `uv sync` calls use it: pytest runs without it.
+          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
           UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
           PYTEST_ARGS: ${{ inputs.pytest-args }}
           MIN_PASSED: ${{ inputs.min-passed }}
@@ -172,6 +174,8 @@ jobs:
           # The two inputs split on spaces, as documented.
           read -ra sync_args <<<"$UV_SYNC_ARGS"
           read -ra pytest_args <<<"$PYTEST_ARGS"
+          # pytest runs the repository's code and its dependencies: keep the token out of its environment.
+          no_token=(env -u GH_TOKEN -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0)
           out="$RUNNER_TEMP/pytest"
           mkdir -p "$out"
           extra=()
@@ -202,7 +206,7 @@ jobs:
             head_sha=$(git rev-parse HEAD)
             git checkout -qf "origin/$BASE_REF"
             uv sync "${sync_args[@]}"
-            uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/base.xml" \
+            "${no_token[@]}" uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/base.xml" \
               > "$out/base.log" 2>&1 || true
             base_passed=$(junit_summary "$out/base.xml" "$out/base_failed.txt")
             echo "target branch: $(wc -l < "$out/base_failed.txt") failing, $base_passed passing tests"
@@ -210,7 +214,7 @@ jobs:
             uv sync "${sync_args[@]}"
           fi
 
-          uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/head.xml" 2>&1 \
+          "${no_token[@]}" uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/head.xml" 2>&1 \
             | tee "$out/head.log"
           rc=${PIPESTATUS[0]}
 

@@ -1,0 +1,7 @@
+paths:
+  # actionlint's bundled data for create-github-app-token@v3 predates `client-id`. Remove once it
+  # catches up (the hook then stops needing these two patterns).
+  .github/workflows/self-release.yml:
+    ignore:
+      - 'input "client-id" is not defined in action "actions/create-github-app-token@v3"'
+      - 'missing input "app-id" which is required by action "actions/create-github-app-token@v3"'

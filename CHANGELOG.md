@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.0...v1.0.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* keep the dependency token out of the test step ([93f0af2](https://github.com/next-gen-infrastructure/github-workflows/commit/93f0af2a04f2f5fc6375e1a4114d427ff34e16a5))
+
 ## [1.0.0](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.0...v1.0.0) (2026-11-26)
 
 

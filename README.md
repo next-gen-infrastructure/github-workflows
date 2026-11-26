@@ -17,7 +17,7 @@ organisation. Pass the secrets with `secrets: inherit`:
 | `DEPS_READER_APP_ID`, `DEPS_READER_PRIVATE_KEY` | `python-test`, `docker-build` | Contents: read |
 | `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY` | `python-dev-tag`, `python-release` | Contents: write |
 
-This repository's own release needs the repository variable `RELEASE_PLEASE_APP_ID` and the secret `RELEASE_PLEASE_PRIVATE_KEY`.
+This repository's own release needs the repository variable `RELEASE_PLEASE_CLIENT_ID` and the secret `RELEASE_PLEASE_PRIVATE_KEY`.
 
 ## Python tests
 

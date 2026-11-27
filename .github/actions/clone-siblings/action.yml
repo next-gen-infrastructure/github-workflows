@@ -14,6 +14,9 @@ inputs:
   sibling-prefix:
     description: Only path dependencies `../<prefix>*` are cloned. Empty clones every `../<name>` dependency.
     default: ''
+  max-parallel:
+    description: Repos cloned at the same time within one dependency level
+    default: '8'
 
 runs:
   using: composite
@@ -27,6 +30,7 @@ runs:
         GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
         BASE_REF: ${{ inputs.base-ref }}
         PREFIX: ${{ inputs.sibling-prefix }}
+        MAX_PARALLEL: ${{ inputs.max-parallel }}
         WORKSPACE: ${{ github.workspace }}
         OWNER: ${{ github.repository_owner }}
       run: |
@@ -34,6 +38,9 @@ runs:
 
         if [[ ! "$PREFIX" =~ ^[A-Za-z0-9._-]*$ || "$PREFIX" == .* ]]; then
           printf '::error::refusing sibling-prefix %q\n' "$PREFIX"; exit 1
+        fi
+        if [[ ! "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
+          printf '::error::refusing max-parallel %q\n' "$MAX_PARALLEL"; exit 1
         fi
 
         # `|| true`: a closure leaf has no matches and grep exits 1, which is not an error.
@@ -52,14 +59,23 @@ runs:
           fi
         }
 
+        export -f clone_repo
+
+        # One dependency level at a time: its repos are independent, so they clone in parallel, and the
+        # next level is read from what this one brought in.
         cd "$WORKSPACE/.."
         frontier="$(extract_siblings "$WORKSPACE")"
         while [ -n "$frontier" ]; do
-          next=""
+          todo=()
           for repo in $frontier; do
-            [ -d "$repo" ] && continue
-            echo "Cloning sibling: $repo"
-            clone_repo "$repo"
+            [ -d "$repo" ] || todo+=("$repo")
+          done
+          if [ ${#todo[@]} -eq 0 ]; then break; fi
+          # xargs stops starting clones once one exits 255, and then fails: one failed clone fails the step.
+          printf '%s\n' "${todo[@]}" \
+            | xargs -P "$MAX_PARALLEL" -I{} bash -c 'echo "Cloning sibling: $1"; clone_repo "$1" || exit 255' _ {}
+          next=""
+          for repo in "${todo[@]}"; do
             next="$next $(extract_siblings "$repo")"
           done
           frontier="$(printf '%s\n' $next | sed '/^$/d' | sort -u | tr '\n' ' ')"

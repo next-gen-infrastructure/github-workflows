@@ -13,9 +13,41 @@ on:
         type: string
         default: tests/unit
         description: >
-          Arguments for `uv run pytest`, split on spaces (no quoting), e.g.
-          `tests --ignore=tests/integration`. Leave out `--junitxml`: the workflow sets its own
-          and counts results from it.
+          Arguments for `uv run pytest`. One argument per line when the value has a newline, so a value
+          with spaces works (`-m` and its expression on two lines); otherwise split on spaces, e.g.
+          `tests --ignore=tests/integration`. Leave out `--junitxml`, `-n` and `--cov*`: the workflow sets them.
+      workers:
+        type: string
+        default: auto
+        description: >
+          pytest-xdist workers. `auto` is one per CPU of the job's cgroup quota, at most 8. `0` runs without
+          xdist. A number sets it exactly. xdist is added for the run when the project lacks it.
+      rerun-failures-serially:
+        type: boolean
+        default: true
+        description: >
+          Re-run the tests that failed in the parallel run, serially. Only those that fail again fail the run;
+          the ones that pass are order-dependent and listed as a warning.
+      fail-on-order-dependent:
+        type: boolean
+        default: false
+        description: Fail the run on order-dependent tests too
+      coverage:
+        type: boolean
+        default: true
+        description: Measure line coverage and report it in the job summary. pytest-cov is added for the run when the project lacks it.
+      coverage-source:
+        type: string
+        default: ""
+        description: What to measure, one source per line or separated by spaces. Empty uses `[tool.coverage.run] source`.
+      coverage-fail-under:
+        type: string
+        default: ""
+        description: Fail when the line coverage is below this percentage, e.g. 85. Empty never fails on coverage.
+      durations:
+        type: number
+        default: 20
+        description: List this many slowest tests in the log. 0 turns it off.
       uv-sync-args:
         type: string
         default: --frozen --all-extras
@@ -75,6 +107,9 @@ on:
       passed:
         description: Number of tests that passed on this branch
         value: ${{ jobs.test.outputs.passed }}
+      coverage:
+        description: Line coverage of this branch in percent, empty when not measured
+        value: ${{ jobs.test.outputs.coverage }}
 
 permissions:
   contents: read
@@ -85,6 +120,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout-minutes }}
     outputs:
       passed: ${{ steps.tests.outputs.passed }}
+      coverage: ${{ steps.tests.outputs.coverage }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -161,94 +197,40 @@ jobs:
           bash "$SCRIPT"
 
       # No continue-on-error: a red repo must be red. With compare-with-base the only tolerated
-      # failures are the ones the target branch has too.
+      # failures are the ones the target branch has too. Not `./`: a local path would resolve in the
+      # caller's checkout. release-please bumps the major.
       - name: Tests
         id: tests
-        env:
-          # Private git sources. Only the `uv sync` calls use it: pytest runs without it.
-          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: credential.https://github.com.helper
-          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
-          UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
-          PYTEST_ARGS: ${{ inputs.pytest-args }}
-          MIN_PASSED: ${{ inputs.min-passed }}
-          COMPARE: ${{ inputs.compare-with-base && github.event_name == 'pull_request' }}
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          set -uo pipefail
-          # The two inputs split on spaces, as documented.
-          read -ra sync_args <<<"$UV_SYNC_ARGS"
-          read -ra pytest_args <<<"$PYTEST_ARGS"
-          # pytest runs the repository's code and its dependencies: keep the token out of its environment.
-          no_token=(env -u GH_TOKEN -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0)
-          out="$RUNNER_TEMP/pytest"
-          mkdir -p "$out"
-          extra=()
-          [ "$COMPARE" = "true" ] && extra=(-q --continue-on-collection-errors)
+        uses: next-gen-infrastructure/github-workflows/.github/actions/run-pytest@v1 # x-release-please-major
+        with:
+          pytest-args: ${{ inputs.pytest-args }}
+          workers: ${{ inputs.workers }}
+          rerun-failures-serially: ${{ inputs.rerun-failures-serially }}
+          fail-on-order-dependent: ${{ inputs.fail-on-order-dependent }}
+          coverage: ${{ inputs.coverage }}
+          coverage-source: ${{ inputs.coverage-source }}
+          coverage-fail-under: ${{ inputs.coverage-fail-under }}
+          durations: ${{ inputs.durations }}
+          min-passed: ${{ inputs.min-passed }}
+          compare-with-base: ${{ inputs.compare-with-base }}
+          base-ref: ${{ github.base_ref }}
+          uv-sync-args: ${{ inputs.uv-sync-args }}
+          # Private git sources, for the `uv sync` of compare-with-base. The action keeps it from pytest.
+          token: ${{ steps.deps-token.outputs.token }}
 
-          # Reads pytest's JUnit XML: prints the passed count, writes the failed ids (sorted) to $2.
-          # No file (pytest died before writing it) counts as 0 passed and no failures.
-          junit_summary() {
-            if [ ! -f "$1" ]; then : > "$2"; echo 0; return; fi
-            uv run --no-project --quiet python - "$1" "$2" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          failed, passed = set(), 0
-          for case in ET.parse(sys.argv[1]).getroot().iter("testcase"):
-              if case.find("failure") is not None or case.find("error") is not None:
-                  # A collection error has no classname.
-                  failed.add("::".join(filter(None, (case.get("classname"), case.get("name")))))
-              elif case.find("skipped") is None:
-                  passed += 1
-          with open(sys.argv[2], "w") as f:
-              f.writelines(f"{i}\n" for i in sorted(failed))
-          print(passed)
-          PY
-          }
-
-          if [ "$COMPARE" = "true" ]; then
-            head_sha=$(git rev-parse HEAD)
-            git checkout -qf "origin/$BASE_REF"
-            uv sync "${sync_args[@]}"
-            "${no_token[@]}" uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/base.xml" \
-              > "$out/base.log" 2>&1 || true
-            base_passed=$(junit_summary "$out/base.xml" "$out/base_failed.txt")
-            echo "target branch: $(wc -l < "$out/base_failed.txt") failing, $base_passed passing tests"
-            git checkout -qf "$head_sha"
-            uv sync "${sync_args[@]}"
-          fi
-
-          "${no_token[@]}" uv run --frozen pytest "${pytest_args[@]}" ${extra[@]+"${extra[@]}"} --junitxml="$out/head.xml" 2>&1 \
-            | tee "$out/head.log"
-          rc=${PIPESTATUS[0]}
-
-          passed=$(junit_summary "$out/head.xml" "$out/head_failed.txt")
-          echo "passed=$passed" >> "$GITHUB_OUTPUT"
-          if [ "$passed" -lt "$MIN_PASSED" ]; then
-            echo "::error::only $passed tests passed (expected at least $MIN_PASSED) - the suite did not run"
-            exit 1
-          fi
-
-          if [ "$COMPARE" != "true" ]; then
-            exit "$rc"
-          fi
-
-          # C collation, to match Python's sorted().
-          LC_ALL=C comm -23 "$out/head_failed.txt" "$out/base_failed.txt" > "$out/new_failures.txt"
-          LC_ALL=C comm -13 "$out/head_failed.txt" "$out/base_failed.txt" > "$out/fixed.txt"
-          new_n=$(wc -l < "$out/new_failures.txt")
-          fixed_n=$(wc -l < "$out/fixed.txt")
-          echo "::notice::$new_n newly failing, $fixed_n newly passing, against $BASE_REF measured in this run"
-          if [ "$fixed_n" -gt 0 ]; then
-            echo "newly PASSING (fixed by this PR):"; cat "$out/fixed.txt"
-          fi
-          if [ "$new_n" -gt 0 ]; then
-            echo "newly FAILING (broken by this PR):"; cat "$out/new_failures.txt"
-            echo "::error::$new_n test(s) fail on this branch and pass on $BASE_REF"
-            exit 1
-          fi
+      # JUnit, coverage and the run logs, also when the tests fail.
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-test-reports
+          path: |
+            ${{ runner.temp }}/pytest/*.xml
+            ${{ runner.temp }}/pytest/*.json
+            ${{ runner.temp }}/pytest/*.log
+            ${{ runner.temp }}/pytest/*.txt
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Upload artifacts
         if: always() && inputs.artifact-paths != ''

@@ -32,14 +32,41 @@ This repository's own release needs the repository variable `RELEASE_PLEASE_CLIE
 ## Python tests
 
 [`python-test.yml`](.github/workflows/python-test.yml) clones the `../<name>` siblings (derived from
-`[tool.uv.sources]`; set `sibling-prefix` to clone only names starting with it), runs `uv sync` and pytest. On a pull request, `compare-with-base` fails only on
-tests that fail here and pass on the target branch.
+`[tool.uv.sources]`, up to 8 repos at a time; set `sibling-prefix` to clone only names starting with it),
+runs `uv sync`, then pytest through the [`run-pytest`](.github/actions/run-pytest/action.yml) action. On a
+pull request, `compare-with-base` fails only on tests that fail here and pass on the target branch.
 
 ```yaml
 jobs:
   test:
     uses: next-gen-infrastructure/github-workflows/.github/workflows/python-test.yml@v1
     secrets: inherit
+```
+
+What the test step does, with no configuration:
+
+- **Parallel.** pytest-xdist with one worker per CPU of the job's quota, at most 8 (`workers`). It is added
+  for the run when the project does not declare it.
+- **Order-dependent tests.** A test that fails in the parallel run is re-run serially. Only those that fail
+  again fail the job. Those that pass are order-dependent: they depend on which worker or which tests ran
+  before them. They are listed in the job summary and as a warning, and do not fail the job unless
+  `fail-on-order-dependent` is set.
+- **Coverage.** Line coverage is measured (`coverage`, pytest-cov added when missing) and shown in the job
+  summary. It never fails the job unless the caller sets `coverage-fail-under`, e.g. `'85'`.
+- **Reports.** JUnit, `coverage.json`, `coverage.xml` and the run logs are uploaded as `python-test-reports`,
+  also when the tests fail.
+- **Token.** The App token reaches `uv sync` only, never pytest.
+
+`pytest-args` takes one argument per line when the value has a newline, so arguments with spaces work.
+Without a newline it splits on spaces, as before:
+
+```yaml
+    with:
+      pytest-args: |
+        tests/unit
+        -m
+        not integration and not tooling
+      coverage-fail-under: '85'
 ```
 
 ## Python lint (changed files)

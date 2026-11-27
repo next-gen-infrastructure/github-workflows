@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.1.0...v1.2.0) (2026-11-27)
+
+
+### Features
+
+* let a listed sibling repo name the paths to stage ([d475fcc](https://github.com/next-gen-infrastructure/github-workflows/commit/d475fcc716351db0acaf937adb7f494209f62383))
+
 ## [1.1.0](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.2...v1.1.0) (2026-11-27)
 
 

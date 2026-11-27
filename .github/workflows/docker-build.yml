@@ -38,7 +38,10 @@ on:
       sibling-repos:
         type: string
         default: ""
-        description: With siblings, repos to take as well, one per line (`#` starts a comment), for siblings the project files don't name.
+        description: >
+          With siblings, repos to take as well, one per line (`#` starts a comment), for siblings the project files
+          don't name. A line may continue with the paths to take from that repo (`name path path`), replacing
+          sibling-files for it.
       sibling-repos-file:
         type: string
         default: ""

@@ -33,7 +33,7 @@ on:
         default: --frozen --all-extras
         description: >
           Arguments for `uv sync`. --all-extras is a workaround for modules that still declare
-          pytest under optional-dependencies instead of dependency-groups (OSI-3181).
+          pytest under optional-dependencies instead of dependency-groups.
       python-version:
         type: string
         default: ""

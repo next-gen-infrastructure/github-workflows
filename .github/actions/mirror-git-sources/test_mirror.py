@@ -12,9 +12,9 @@ UV_LOCK = """
 version = 1
 
 [[package]]
-name = "osint-private"
+name = "lib-private"
 version = "0.1.0"
-source = { git = "https://github.com/acme/osint-private?rev=main#0123456789abcdef" }
+source = { git = "https://github.com/acme/lib-private?rev=main#0123456789abcdef" }
 
 [[package]]
 name = "tool"
@@ -39,7 +39,7 @@ source = { editable = "." }
 
 
 def test_from_uv_lock_takes_github_git_sources_only(capsys):
-    assert mi.from_uv_lock(UV_LOCK) == {"acme/osint-private", "other/tool"}
+    assert mi.from_uv_lock(UV_LOCK) == {"acme/lib-private", "other/tool"}
     assert "gitlab.com" in capsys.readouterr().out  # a source that cannot be mirrored is reported, not silent
 
 
@@ -49,7 +49,7 @@ def test_from_uv_lock_without_git_sources():
 
 def test_git_sources_reads_the_lock_file_it_finds(tmp_path):
     (tmp_path / "uv.lock").write_text(UV_LOCK)
-    assert mi.git_sources(tmp_path) == ["acme/osint-private", "other/tool"]
+    assert mi.git_sources(tmp_path) == ["acme/lib-private", "other/tool"]
 
 
 def test_git_sources_fails_without_a_supported_lock_file(tmp_path):
@@ -62,7 +62,7 @@ def test_git_sources_adds_up_every_lock_file_found(tmp_path, monkeypatch):
     (tmp_path / "uv.lock").write_text(UV_LOCK)
     (tmp_path / "other.lock").write_text("x")
     monkeypatch.setitem(mi.LOCK_READERS, "other.lock", lambda text: {"acme/from-other"})
-    assert mi.git_sources(tmp_path) == ["acme/from-other", "acme/osint-private", "other/tool"]
+    assert mi.git_sources(tmp_path) == ["acme/from-other", "acme/lib-private", "other/tool"]
 
 
 def test_mirror_clones_each_repo_bare_into_owner_dirs_named_dot_git(tmp_path):

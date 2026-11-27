@@ -122,6 +122,12 @@ jobs:
 
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
+      # Self-hosted runners can keep uv's default cache (~/.cache/uv) on another filesystem than the
+      # workspace. uv then cannot hardlink and copies every package: 28s instead of 1s for 82 packages.
+      # The runner temp dir is on the workspace's filesystem. Keeps a cache dir setup-uv already set.
+      - name: Keep the uv cache on the workspace filesystem
+        run: '[ -n "${UV_CACHE_DIR:-}" ] || echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"'
+
       - name: Pin Python
         if: inputs.python-version != ''
         env:

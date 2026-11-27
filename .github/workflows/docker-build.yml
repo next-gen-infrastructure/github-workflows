@@ -26,31 +26,28 @@ on:
       timeout-minutes:
         type: number
         default: 30
-      dependency-repos:
-        type: string
-        default: ""
-        description: >
-          Newline-separated repos cloned into the build context at the build branch (a Dockerfile
-          COPYs them). Their .git is removed so no token stays in the context.
-      dependency-repos-file:
-        type: string
-        default: ""
-        description: >
-          Path in the checkout to a file of repos, one per line (blank lines and # comments are
-          ignored), merged with dependency-repos. Lets other workflows read the same list.
-      siblings-from-pyproject:
+      siblings:
         type: boolean
         default: false
         description: >
-          Derive the sibling repos from the `../<name>` path dependencies in `[tool.uv.sources]` (and theirs,
-          until nothing new appears), clone them at the build branch, and pass them to the build as the
-          named context `siblings`. The Dockerfile takes them with `COPY --from=siblings / /`, so no list of
-          repos is kept anywhere. There is no fallback to another branch.
+          Clone the sibling repos the project files name (e.g. the `../<name>` path dependencies in `[tool.uv.sources]`
+          of pyproject.toml) and those in sibling-repos and sibling-repos-file, and theirs too, until nothing new
+          appears, at the build branch, and pass them to the
+          build as the named context `siblings`. The Dockerfile takes them with `COPY --from=siblings / /`, so
+          no list of repos is kept anywhere. There is no fallback to another branch.
+      sibling-repos:
+        type: string
+        default: ""
+        description: With siblings, repos to take as well, one per line (`#` starts a comment), for siblings the project files don't name.
+      sibling-repos-file:
+        type: string
+        default: ""
+        description: With siblings, path in the checkout to a file of repos, one per line, merged with sibling-repos.
       sibling-files:
         type: string
         default: ""
         description: >
-          With siblings-from-pyproject, the paths kept from each sibling, one per line or separated by spaces,
+          With siblings, the paths kept from each sibling, one per line or separated by spaces,
           e.g. `src pyproject.toml README.md`. Empty keeps everything except .git.
       context:
         type: string
@@ -82,10 +79,6 @@ on:
         type: number
         default: 5
         description: Dev versions to keep when cleanup is on; -1 keeps all
-      cleanup-dry-run:
-        type: boolean
-        default: false
-        description: Only report what the cleanup would delete
       cleanup-runs-on:
         type: string
         default: ubuntu-latest
@@ -93,7 +86,9 @@ on:
       mirror-git-sources:
         type: boolean
         default: false
-        description: Mirror the git sources pinned in uv.lock and expose them as the `git-mirrors` build context
+        description: >
+          Mirror the git dependencies the lock file pins (today uv.lock) and expose them as the `git-mirrors` build
+          context, so a build with no credentials can fetch them. Fails when the project has no supported lock file.
       free-disk-space:
         type: boolean
         default: false
@@ -105,7 +100,7 @@ on:
     secrets:
       DEPS_READER_APP_ID:
         required: false
-        description: Needed with dependency-repos, dependency-repos-file, siblings-from-pyproject or mirror-git-sources
+        description: Needed with siblings or mirror-git-sources
       DEPS_READER_PRIVATE_KEY:
         required: false
       BUILD_ENV_FILE:
@@ -181,109 +176,39 @@ jobs:
 
       - name: Read token for private dependency repos
         id: deps-token
-        if: inputs.dependency-repos != '' || inputs.dependency-repos-file != '' || inputs.siblings-from-pyproject || inputs.mirror-git-sources
+        if: inputs.siblings || inputs.mirror-git-sources
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.DEPS_READER_APP_ID }}
           private-key: ${{ secrets.DEPS_READER_PRIVATE_KEY }}
-          # Owner-wide: the repos come from dependency-repos(-file), pyproject.toml and uv.lock at run time.
+          # Owner-wide: the repos come from the project files, the sibling lists and the lock file at run time.
           owner: ${{ github.repository_owner }} # zizmor: ignore[github-app]
           permission-contents: read
 
-      # No fallback to another branch: a main build must not silently bake in dev code.
-      - name: Clone dependencies into the build context
-        if: inputs.dependency-repos != '' || inputs.dependency-repos-file != ''
-        env:
-          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: credential.https://github.com.helper
-          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
-          OWNER: ${{ github.repository_owner }}
-          BRANCH: ${{ steps.target.outputs.branch }}
-          REPOS: ${{ inputs.dependency-repos }}
-          REPOS_FILE: ${{ inputs.dependency-repos-file }}
-          SOURCE: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_repo || '' }}
-        run: |
-          set -euo pipefail
-          if [ -n "$SOURCE" ] && [[ ! "$SOURCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            printf '::error::refusing source_repo %q\n' "$SOURCE"; exit 1
-          fi
-          from_file=""
-          if [ -n "$REPOS_FILE" ]; then
-            [ -f "$REPOS_FILE" ] || { printf '::error::dependency-repos-file %q not found at the build branch\n' "$REPOS_FILE"; exit 1; }
-            from_file="$(cat "$REPOS_FILE")"
-          fi
-          # Inline and file lists merged: comments and blanks dropped, duplicates removed.
-          repos="$(printf '%s\n%s\n' "$REPOS" "$from_file" | sed -E 's/#.*//; s/[[:space:]]+//g' | sed '/^$/d' | sort -u)"
-          if [ -z "$repos" ]; then
-            echo "::error::no dependency repos resolved"; exit 1
-          fi
-          while IFS= read -r repo; do
-            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-              printf '::error::refusing dependency repo %q\n' "$repo"; exit 1
-            fi
-            git clone --depth 1 -b "$BRANCH" "https://github.com/${OWNER}/${repo}.git" "$repo"
-            if [ "$repo" = "$SOURCE" ]; then
-              echo "SUBMODULE_SHA=-$(git -C "$repo" rev-parse --short HEAD)" >> "$GITHUB_ENV"
-            fi
-            rm -rf "$repo/.git"
-          done <<< "$repos"
-
       # Not `./`: a local path would resolve in the caller's checkout. release-please bumps the major.
-      # No fallback to another branch: a main build must not silently bake in dev code.
-      - name: Clone the siblings pyproject.toml names
-        id: siblings
-        if: inputs.siblings-from-pyproject
+      # No fallback to another branch: a main build must not silently bake in dev code. The named context
+      # holds /<repo>/<files>, so `COPY --from=siblings / /` puts each at /<repo>, where the editable path
+      # dependencies (`../<repo>` from /app) point. It stays out of `COPY . /app/`.
+      - name: Clone the siblings as the `siblings` build context
+        if: inputs.siblings
         uses: next-gen-infrastructure/github-workflows/.github/actions/clone-siblings@v1 # x-release-please-major
         with:
           token: ${{ steps.deps-token.outputs.token }}
           base-ref: ${{ steps.target.outputs.branch }}
           fallback-ref: ""
+          sibling-repos: ${{ inputs.sibling-repos }}
+          sibling-repos-file: ${{ inputs.sibling-repos-file }}
+          stage-dir: ${{ runner.temp }}/siblings
+          stage-files: ${{ inputs.sibling-files }}
+          source-repo: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_repo || '' }}
 
-      # The named context holds /<repo>/<files>, so `COPY --from=siblings / /` puts each at /<repo>, where the
-      # editable path dependencies (`../<repo>` from /app) point. It stays out of `COPY . /app/`.
-      - name: Stage the siblings as the `siblings` build context
-        if: inputs.siblings-from-pyproject
-        env:
-          REPOS: ${{ steps.siblings.outputs.repos }}
-          FILES: ${{ inputs.sibling-files }}
-          SOURCE: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_repo || '' }}
-          WORKSPACE: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          if [ -n "$SOURCE" ] && [[ ! "$SOURCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            printf '::error::refusing source_repo %q\n' "$SOURCE"; exit 1
-          fi
-          [ -n "$REPOS" ] || { echo "::error::pyproject.toml names no sibling repositories"; exit 1; }
-          set -f  # a pattern in sibling-files is a name, not a glob
-          dest="$RUNNER_TEMP/siblings"
-          rm -rf "$dest"
-          mkdir -p "$dest"
-          for repo in $REPOS; do
-            src="$WORKSPACE/../$repo"
-            mkdir "$dest/$repo"
-            # tar fails the step on a path the sibling lacks; empty FILES takes everything but .git
-            # shellcheck disable=SC2086  # FILES is a list of names, split on purpose (globbing is off)
-            tar -C "$src" --exclude=.git -cf - ${FILES:-.} | tar -C "$dest/$repo" -xf -
-            if [ "$repo" = "$SOURCE" ]; then
-              echo "SUBMODULE_SHA=-$(git -C "$src" rev-parse --short HEAD)" >> "$GITHUB_ENV"
-            fi
-          done
-
-      - name: Mirror the git sources uv.lock pins
+      # Not `./`: a local path would resolve in the caller's checkout. release-please bumps the major.
+      - name: Mirror the git sources the lock file pins
         if: inputs.mirror-git-sources
-        env:
-          GH_TOKEN: ${{ steps.deps-token.outputs.token }}
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: credential.https://github.com.helper
-          GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
-        run: |
-          mkdir -p "$RUNNER_TEMP/git-mirrors"
-          { grep -oE '^source = \{ git = "https://github.com/[^?"]+' uv.lock || true; } |
-            sed 's#.*github.com/##' | sort -u |
-            while read -r repo; do
-              git clone -q --bare "https://github.com/$repo" "$RUNNER_TEMP/git-mirrors/$repo"
-            done
+        uses: next-gen-infrastructure/github-workflows/.github/actions/mirror-git-sources@v1 # x-release-please-major
+        with:
+          token: ${{ steps.deps-token.outputs.token }}
+          mirror-dir: ${{ runner.temp }}/git-mirrors
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -320,7 +245,7 @@ jobs:
         id: contexts
         env:
           MIRROR: ${{ inputs.mirror-git-sources }}
-          SIBLINGS: ${{ inputs.siblings-from-pyproject }}
+          SIBLINGS: ${{ inputs.siblings }}
         run: |
           {
             echo 'list<<CONTEXTS_END'
@@ -379,4 +304,3 @@ jobs:
           package: ${{ inputs.image-name }}
           keep-main: ${{ inputs.keep-main }}
           keep-dev: ${{ inputs.keep-dev }}
-          dry-run: ${{ inputs.cleanup-dry-run }}

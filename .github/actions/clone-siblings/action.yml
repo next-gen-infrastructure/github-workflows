@@ -2,14 +2,19 @@ name: Clone sibling packages
 description: >
   Clone the `../<sibling-prefix>*` path dependencies of this repo next to the workspace. The set is derived
   from `[tool.uv.sources]` in pyproject.toml, then from each cloned sibling's own pyproject.toml,
-  until nothing new appears. Clones the PR base branch, falling back to dev.
+  until nothing new appears. Clones the PR base branch, falling back to dev unless `fallback-ref` is empty.
 
 inputs:
   token:
     description: Token with read access to the private sibling repos
     required: true
   base-ref:
-    description: Branch to clone from; falls back to dev when a sibling lacks it
+    description: Branch to clone from
+    default: dev
+  fallback-ref:
+    description: >
+      Branch to clone when a sibling lacks base-ref. Empty means no fallback: a sibling without base-ref
+      fails the step (for a build that must never mix in another branch's code).
     default: dev
   sibling-prefix:
     description: Only path dependencies `../<prefix>*` are cloned. Empty clones every `../<name>` dependency.
@@ -18,10 +23,16 @@ inputs:
     description: Repos cloned at the same time within one dependency level
     default: '8'
 
+outputs:
+  repos:
+    description: The repos this step cloned, separated by spaces
+    value: ${{ steps.clone.outputs.repos }}
+
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: clone
+      shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
         # Credential helper, so the token never lands in a sibling's .git/config.
@@ -29,6 +40,7 @@ runs:
         GIT_CONFIG_KEY_0: credential.https://github.com.helper
         GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
         BASE_REF: ${{ inputs.base-ref }}
+        FALLBACK_REF: ${{ inputs.fallback-ref }}
         PREFIX: ${{ inputs.sibling-prefix }}
         MAX_PARALLEL: ${{ inputs.max-parallel }}
         WORKSPACE: ${{ github.workspace }}
@@ -38,6 +50,9 @@ runs:
 
         if [[ ! "$PREFIX" =~ ^[A-Za-z0-9._-]*$ || "$PREFIX" == .* ]]; then
           printf '::error::refusing sibling-prefix %q\n' "$PREFIX"; exit 1
+        fi
+        if [[ ! "$FALLBACK_REF" =~ ^[A-Za-z0-9._/-]*$ ]]; then
+          printf '::error::refusing fallback-ref %q\n' "$FALLBACK_REF"; exit 1
         fi
         if [[ ! "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
           printf '::error::refusing max-parallel %q\n' "$MAX_PARALLEL"; exit 1
@@ -54,8 +69,11 @@ runs:
           local repo="$1"
           local url="https://github.com/${OWNER}/${repo}.git"
           if ! git clone --depth 1 -b "$BASE_REF" "$url" "$repo" 2>/dev/null; then
-            echo "branch $BASE_REF not in $repo; falling back to dev"
-            git clone --depth 1 -b dev "$url" "$repo"
+            if [ -z "$FALLBACK_REF" ]; then
+              echo "::error::branch $BASE_REF not in $repo"; return 1
+            fi
+            echo "branch $BASE_REF not in $repo; falling back to $FALLBACK_REF"
+            git clone --depth 1 -b "$FALLBACK_REF" "$url" "$repo"
           fi
         }
 
@@ -65,6 +83,7 @@ runs:
         # next level is read from what this one brought in.
         cd "$WORKSPACE/.."
         frontier="$(extract_siblings "$WORKSPACE")"
+        cloned=()
         while [ -n "$frontier" ]; do
           todo=()
           for repo in $frontier; do
@@ -76,6 +95,7 @@ runs:
             | xargs -P "$MAX_PARALLEL" -I{} bash -c 'echo "Cloning sibling: $1"; clone_repo "$1" || exit 255' _ {}
           next=""
           for repo in "${todo[@]}"; do
+            cloned+=("$repo")
             next="$next $(extract_siblings "$repo")"
           done
           frontier="$(printf '%s\n' $next | sed '/^$/d' | sort -u | tr '\n' ' ')"
@@ -83,3 +103,4 @@ runs:
 
         echo "Resolved sibling closure:"
         find . -maxdepth 1 -type d -name "${PREFIX}*" | sort
+        echo "repos=${cloned[*]:-}" >> "$GITHUB_OUTPUT"

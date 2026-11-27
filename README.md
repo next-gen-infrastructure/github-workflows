@@ -10,12 +10,22 @@ triggers, `concurrency` and test gate (`needs:`).
 ## Setup
 
 The private-dependency and release workflows authenticate through a GitHub App you own, installed on the
-organisation. Pass the secrets with `secrets: inherit`:
+organisation. Pass the secrets with `secrets: inherit`, as the examples below do:
 
 | Secrets | Used by | App permissions |
 |---|---|---|
 | `DEPS_READER_APP_ID`, `DEPS_READER_PRIVATE_KEY` | `python-test`, `docker-build` | Contents: read |
 | `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY` | `python-dev-tag`, `python-release` | Contents: write |
+
+**Callers in another organisation.** `secrets: inherit` only passes secrets to workflows in the caller's own
+organisation or enterprise, so across organisations the called workflow gets nothing and fails with
+"Secret ... is required, but not provided". Replace `secrets: inherit` with an explicit mapping:
+
+```yaml
+    secrets:
+      DEPS_READER_APP_ID: ${{ secrets.DEPS_READER_APP_ID }}
+      DEPS_READER_PRIVATE_KEY: ${{ secrets.DEPS_READER_PRIVATE_KEY }}
+```
 
 This repository's own release needs the repository variable `RELEASE_PLEASE_CLIENT_ID` and the secret `RELEASE_PLEASE_PRIVATE_KEY`.
 

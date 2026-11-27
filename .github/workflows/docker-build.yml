@@ -38,6 +38,24 @@ on:
         description: >
           Path in the checkout to a file of repos, one per line (blank lines and # comments are
           ignored), merged with dependency-repos. Lets other workflows read the same list.
+      siblings-from-pyproject:
+        type: boolean
+        default: false
+        description: >
+          Derive the sibling repos from the `../<name>` path dependencies in `[tool.uv.sources]` (and theirs,
+          until nothing new appears), clone them at the build branch, and pass them to the build as the
+          named context `siblings`. The Dockerfile takes them with `COPY --from=siblings / /`, so no list of
+          repos is kept anywhere. There is no fallback to another branch.
+      sibling-prefix:
+        type: string
+        default: ""
+        description: With siblings-from-pyproject, only path dependencies named `../<prefix>*`. Empty takes every one.
+      sibling-files:
+        type: string
+        default: ""
+        description: >
+          With siblings-from-pyproject, the paths kept from each sibling, one per line or separated by spaces,
+          e.g. `src pyproject.toml README.md`. Empty keeps everything except .git.
       context:
         type: string
         default: .
@@ -91,7 +109,7 @@ on:
     secrets:
       DEPS_READER_APP_ID:
         required: false
-        description: Needed with dependency-repos, dependency-repos-file or mirror-git-sources
+        description: Needed with dependency-repos, dependency-repos-file, siblings-from-pyproject or mirror-git-sources
       DEPS_READER_PRIVATE_KEY:
         required: false
       BUILD_ENV_FILE:
@@ -167,12 +185,12 @@ jobs:
 
       - name: Read token for private dependency repos
         id: deps-token
-        if: inputs.dependency-repos != '' || inputs.dependency-repos-file != '' || inputs.mirror-git-sources
+        if: inputs.dependency-repos != '' || inputs.dependency-repos-file != '' || inputs.siblings-from-pyproject || inputs.mirror-git-sources
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.DEPS_READER_APP_ID }}
           private-key: ${{ secrets.DEPS_READER_PRIVATE_KEY }}
-          # Owner-wide: the repos come from dependency-repos(-file) and uv.lock at run time.
+          # Owner-wide: the repos come from dependency-repos(-file), pyproject.toml and uv.lock at run time.
           owner: ${{ github.repository_owner }} # zizmor: ignore[github-app]
           permission-contents: read
 
@@ -214,6 +232,62 @@ jobs:
             fi
             rm -rf "$repo/.git"
           done <<< "$repos"
+
+      # Not `./`: a local path would resolve in the caller's checkout. release-please bumps the major.
+      # No fallback to another branch: a main build must not silently bake in dev code.
+      - name: Clone the siblings pyproject.toml names
+        id: siblings
+        if: inputs.siblings-from-pyproject
+        uses: next-gen-infrastructure/github-workflows/.github/actions/clone-siblings@v1 # x-release-please-major
+        with:
+          token: ${{ steps.deps-token.outputs.token }}
+          base-ref: ${{ steps.target.outputs.branch }}
+          fallback-ref: ""
+          sibling-prefix: ${{ inputs.sibling-prefix }}
+
+      # The named context holds /<repo>/<files>, so `COPY --from=siblings / /` puts each at /<repo>, where the
+      # editable path dependencies (`../<repo>` from /app) point. It stays out of `COPY . /app/`.
+      - name: Stage the siblings as the `siblings` build context
+        if: inputs.siblings-from-pyproject
+        env:
+          REPOS: ${{ steps.siblings.outputs.repos }}
+          FILES: ${{ inputs.sibling-files }}
+          SOURCE: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_repo || '' }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SOURCE" ] && [[ ! "$SOURCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            printf '::error::refusing source_repo %q\n' "$SOURCE"; exit 1
+          fi
+          [ -n "$REPOS" ] || { echo "::error::pyproject.toml names no sibling repositories"; exit 1; }
+          files=()
+          set -f  # a pattern in sibling-files is a name, not a glob
+          for f in $FILES; do
+            if [[ ! "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "$f" == *..* ]]; then
+              printf '::error::refusing sibling-files entry %q\n' "$f"; exit 1
+            fi
+            files+=("$f")
+          done
+          set +f
+          dest="$RUNNER_TEMP/siblings"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          for repo in $REPOS; do
+            src="$WORKSPACE/../$repo"
+            mkdir "$dest/$repo"
+            if [ ${#files[@]} -eq 0 ]; then
+              tar -C "$src" --exclude=.git -cf - . | tar -C "$dest/$repo" -xf -
+            else
+              for f in "${files[@]}"; do
+                [ -e "$src/$f" ] || { printf '::error::%s has no %s\n' "$repo" "$f"; exit 1; }
+              done
+              tar -C "$src" -cf - "${files[@]}" | tar -C "$dest/$repo" -xf -
+            fi
+            if [ "$repo" = "$SOURCE" ]; then
+              echo "SUBMODULE_SHA=-$(git -C "$src" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+            fi
+          done
+          echo "Staged $(wc -w <<<"$REPOS") siblings"
 
       - name: Mirror the git sources uv.lock pins
         if: inputs.mirror-git-sources
@@ -261,6 +335,19 @@ jobs:
           BUILD_ENV_FILE: ${{ secrets.BUILD_ENV_FILE }}
         run: printf '%s\n' "$BUILD_ENV_FILE" > "$RUNNER_TEMP/build.env"
 
+      - name: Build contexts
+        id: contexts
+        env:
+          MIRROR: ${{ inputs.mirror-git-sources }}
+          SIBLINGS: ${{ inputs.siblings-from-pyproject }}
+        run: |
+          {
+            echo 'list<<CONTEXTS_END'
+            if [ "$MIRROR" = true ]; then echo "git-mirrors=$RUNNER_TEMP/git-mirrors"; fi
+            if [ "$SIBLINGS" = true ]; then echo "siblings=$RUNNER_TEMP/siblings"; fi
+            echo 'CONTEXTS_END'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push image
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -272,7 +359,7 @@ jobs:
           push: ${{ steps.target.outputs.mode != 'pr' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-contexts: ${{ inputs.mirror-git-sources && format('git-mirrors={0}/git-mirrors', runner.temp) || '' }}
+          build-contexts: ${{ steps.contexts.outputs.list }}
           secret-files: ${{ env.HAS_BUILD_ENV == 'true' && format('env={0}/build.env', runner.temp) || '' }}
           sbom: ${{ inputs.sbom }}
           # GitHub Actions cache, one scope per image. 10 GB per repo, oldest entries evicted first.

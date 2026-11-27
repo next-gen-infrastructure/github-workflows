@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.2...v1.1.0) (2026-11-27)
+
+
+### Features
+
+* derive the docker build's sibling repos from pyproject.toml ([f2a4591](https://github.com/next-gen-infrastructure/github-workflows/commit/f2a4591ca5903651820138f61297847fd20706fc))
+* run python tests in parallel with serial re-runs and coverage ([2504e6d](https://github.com/next-gen-infrastructure/github-workflows/commit/2504e6dbbdae9bd1fd7a4035e07c58f1baf47e37))
+
 ## [1.0.2](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.1...v1.0.2) (2026-11-27)
 
 

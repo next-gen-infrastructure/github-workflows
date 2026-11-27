@@ -91,6 +91,4 @@ runs:
           frontier="$(printf '%s\n' $next | sed '/^$/d' | sort -u | tr '\n' ' ')"
         done
 
-        echo "Resolved sibling closure:"
-        find . -maxdepth 1 -type d -name "${PREFIX}*" | sort
         echo "repos=${cloned[*]:-}" >> "$GITHUB_OUTPUT"

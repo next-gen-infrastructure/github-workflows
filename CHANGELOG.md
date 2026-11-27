@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.1...v1.0.2) (2026-11-27)
+
+
+### Bug Fixes
+
+* keep the uv cache on the workspace filesystem ([#12](https://github.com/next-gen-infrastructure/github-workflows/issues/12)) ([ec96005](https://github.com/next-gen-infrastructure/github-workflows/commit/ec9600520b07891908624be300f989c785a2d58d))
+
 ## [1.0.1](https://github.com/next-gen-infrastructure/github-workflows/compare/v1.0.0...v1.0.1) (2026-11-26)
 
 

@@ -15,39 +15,21 @@ on:
         description: >
           Arguments for `uv run pytest`. One argument per line when the value has a newline, so a value
           with spaces works (`-m` and its expression on two lines); otherwise split on spaces, e.g.
-          `tests --ignore=tests/integration`. Leave out `--junitxml`, `-n` and `--cov*`: the workflow sets them.
+          `tests --ignore=tests/integration`. Leave out `-n` and `--cov*`: the workflow sets them.
       workers:
         type: string
         default: auto
         description: >
-          pytest-xdist workers. `auto` is one per CPU of the job's cgroup quota, at most 8. `0` runs without
-          xdist. A number sets it exactly. xdist is added for the run when the project lacks it.
-      rerun-failures-serially:
-        type: boolean
-        default: true
-        description: >
-          Re-run the tests that failed in the parallel run, serially. Only those that fail again fail the run;
-          the ones that pass are order-dependent and listed as a warning.
-      fail-on-order-dependent:
-        type: boolean
-        default: false
-        description: Fail the run on order-dependent tests too
+          pytest-xdist workers. `auto` is one per CPU of the job's cgroup quota, at most 8, and runs serially
+          when the project lacks pytest-xdist. `0` runs without xdist. A number sets it exactly.
       coverage:
         type: boolean
         default: true
-        description: Measure line coverage and report it in the job summary. pytest-cov is added for the run when the project lacks it.
-      coverage-source:
-        type: string
-        default: ""
-        description: What to measure, one source per line or separated by spaces. Empty uses `[tool.coverage.run] source`.
+        description: Measure line coverage and report it in the job summary (needs pytest-cov in the project)
       coverage-fail-under:
         type: string
         default: ""
         description: Fail when the line coverage is below this percentage, e.g. 85. Empty never fails on coverage.
-      durations:
-        type: number
-        default: 20
-        description: List this many slowest tests in the log. 0 turns it off.
       uv-sync-args:
         type: string
         default: --frozen --all-extras
@@ -62,12 +44,6 @@ on:
         type: number
         default: 0
         description: Fail when fewer tests passed, so a suite that silently stopped running is red. 0 disables it.
-      compare-with-base:
-        type: boolean
-        default: false
-        description: >
-          Pull requests only: measure the target branch in this run and fail only on tests that
-          fail here and pass there. Without it, any failing test fails the run.
       free-disk-space:
         type: boolean
         default: false
@@ -75,7 +51,7 @@ on:
       artifact-paths:
         type: string
         default: ""
-        description: Newline-separated paths uploaded as the `python-test-artifacts` artifact, even when the tests fail (logs, coverage)
+        description: Newline-separated paths uploaded with the test log and the coverage report as the `python-test-artifacts` artifact, even when the tests fail
       timeout-minutes:
         type: number
         default: 360
@@ -107,9 +83,6 @@ on:
       passed:
         description: Number of tests that passed on this branch
         value: ${{ jobs.test.outputs.passed }}
-      coverage:
-        description: Line coverage of this branch in percent, empty when not measured
-        value: ${{ jobs.test.outputs.coverage }}
 
 permissions:
   contents: read
@@ -120,12 +93,9 @@ jobs:
     timeout-minutes: ${{ inputs.timeout-minutes }}
     outputs:
       passed: ${{ steps.tests.outputs.passed }}
-      coverage: ${{ steps.tests.outputs.coverage }}
     steps:
       - uses: actions/checkout@v7
         with:
-          # Comparing with the base needs its history. Strings: a bare 0 is falsy and always gave 1.
-          fetch-depth: ${{ inputs.compare-with-base && '0' || '1' }}
           persist-credentials: ${{ inputs.persist-credentials }}
 
       - name: Free disk space
@@ -196,47 +166,27 @@ jobs:
           [ -f "$SCRIPT" ] || { printf '::error::pre-test-script %q not found\n' "$SCRIPT"; exit 1; }
           bash "$SCRIPT"
 
-      # No continue-on-error: a red repo must be red. With compare-with-base the only tolerated
-      # failures are the ones the target branch has too. Not `./`: a local path would resolve in the
-      # caller's checkout. release-please bumps the major.
+      # No continue-on-error: a red repo must be red. Not `./`: a local path would resolve in the caller's
+      # checkout. release-please bumps the major.
       - name: Tests
         id: tests
         uses: next-gen-infrastructure/github-workflows/.github/actions/run-pytest@v1 # x-release-please-major
         with:
           pytest-args: ${{ inputs.pytest-args }}
           workers: ${{ inputs.workers }}
-          rerun-failures-serially: ${{ inputs.rerun-failures-serially }}
-          fail-on-order-dependent: ${{ inputs.fail-on-order-dependent }}
           coverage: ${{ inputs.coverage }}
-          coverage-source: ${{ inputs.coverage-source }}
           coverage-fail-under: ${{ inputs.coverage-fail-under }}
-          durations: ${{ inputs.durations }}
           min-passed: ${{ inputs.min-passed }}
-          compare-with-base: ${{ inputs.compare-with-base }}
-          base-ref: ${{ github.base_ref }}
-          uv-sync-args: ${{ inputs.uv-sync-args }}
-          # Private git sources, for the `uv sync` of compare-with-base. The action keeps it from pytest.
-          token: ${{ steps.deps-token.outputs.token }}
 
-      # JUnit, coverage and the run logs, also when the tests fail.
-      - name: Upload test reports
+      # The test log and the coverage report, plus the caller's paths, also when the tests fail.
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: python-test-reports
-          path: |
-            ${{ runner.temp }}/pytest/*.xml
-            ${{ runner.temp }}/pytest/*.json
-            ${{ runner.temp }}/pytest/*.log
-            ${{ runner.temp }}/pytest/*.txt
-          retention-days: 14
-          if-no-files-found: ignore
-
-      - name: Upload artifacts
-        if: always() && inputs.artifact-paths != ''
-        uses: actions/upload-artifact@v7
-        with:
           name: python-test-artifacts
-          path: ${{ inputs.artifact-paths }}
+          path: |
+            ${{ runner.temp }}/pytest/head.log
+            ${{ runner.temp }}/pytest/coverage.json
+            ${{ inputs.artifact-paths }}
           retention-days: 14
           if-no-files-found: warn

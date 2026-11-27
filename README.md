@@ -180,11 +180,13 @@ jobs:
     secrets: inherit
 ```
 
-**Sibling repos without a list (`siblings-from-pyproject`).** For an image whose `pyproject.toml` has
-`../<name>` path dependencies, the build derives the repos from `[tool.uv.sources]` (and from each one's own
-`pyproject.toml`), clones them at the build branch and passes them to the build as the named context
-`siblings`. No list of repos is kept in the workflow or the Dockerfile. There is no fallback to another
-branch: a main build never takes dev code.
+**Sibling repos (`siblings`).** For an image that needs other repos next to the app, the build takes the
+siblings its project files name (today the `../<name>` path dependencies in `[tool.uv.sources]` of a
+`pyproject.toml`, and each one's own), clones them at the build branch and passes them to the build as the
+named context `siblings`. Siblings the files don't name go in `sibling-repos` or `sibling-repos-file` (one
+per line, `#` comments); the lists add to what the files name. No repo list is kept in the Dockerfile. There is no fallback to another
+branch: a main build never takes dev code. `sibling-files` keeps only the given paths of each sibling. The
+runner needs Python 3.11+, which the Ubuntu 24.04 images have.
 
 ```dockerfile
 # An empty stub, so a plain local `docker build` still parses; the workflow replaces it.
@@ -203,6 +205,20 @@ COPY --from=siblings / /
 ```
 
 The context stays out of `COPY . /app/`. For a local build, pass `--build-context siblings=<dir>`.
+
+**Private git dependencies (`mirror-git-sources`).** A build has no credentials, so git dependencies on private
+repos would fail to fetch. With the flag, the action reads the lock file (today `uv.lock`; it fails when none
+of the supported ones exists), bare-clones each `github.com` source and passes the mirrors as the named context
+`git-mirrors`. The Dockerfile points git at them:
+
+```dockerfile
+FROM scratch AS git-mirrors
+
+FROM python:3.12-slim AS builder
+RUN --mount=type=bind,from=git-mirrors,target=/git-mirrors \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url./git-mirrors/.insteadOf GIT_CONFIG_VALUE_0=https://github.com/ \
+    uv sync --frozen
+```
 
 **Build secret file (`BUILD_ENV_FILE`).** For an image that needs build-time settings from a `.env` file
 (for example a front-end image), store the whole `.env` as one secret named `BUILD_ENV_FILE` in a GitHub

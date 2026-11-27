@@ -1,0 +1,28 @@
+name: Mirror git sources
+description: >
+  Bare-clone the git dependencies the project's lock file pins (today uv.lock; one reader per lock-file kind),
+  so a docker build with no credentials can fetch them from the mirrors through
+  `git config url.<mirror>.insteadOf https://github.com/`. Only github.com sources are mirrored. Fails when the
+  project has no supported lock file. Needs Python 3.11+. The logic is in mirror.py next to this file.
+
+inputs:
+  token:
+    description: Token with read access to the private repos
+    required: true
+  mirror-dir:
+    description: Directory the mirrors are written to, as <mirror-dir>/<owner>/<repo>.git
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        # Credential helper, so the token never lands in a mirror's config.
+        GIT_CONFIG_COUNT: 1
+        GIT_CONFIG_KEY_0: credential.https://github.com.helper
+        GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
+        MIRROR_DIR: ${{ inputs.mirror-dir }}
+        WORKSPACE: ${{ github.workspace }}
+      run: python3 "$GITHUB_ACTION_PATH/mirror.py"

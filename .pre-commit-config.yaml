@@ -31,9 +31,9 @@ repos:
         entry: node --test .github/actions/ghcr-cleanup/cleanup-ghcr.test.js
         files: ^\.github/actions/ghcr-cleanup/
         pass_filenames: false
-      - id: run-pytest-test
-        name: run-pytest unit tests
+      - id: actions-python-test
+        name: Python actions unit tests
         language: system
-        entry: uv run --no-project --with pytest pytest -q .github/actions/run-pytest
-        files: ^\.github/actions/run-pytest/
+        entry: uv run --no-project --with pytest pytest -q .github/actions
+        files: ^\.github/actions/.*\.py$
         pass_filenames: false

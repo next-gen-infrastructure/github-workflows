@@ -15,11 +15,10 @@ inputs:
       pytest-xdist workers. `auto` is one per CPU of the cgroup quota, at most 8, and runs serially when the
       project lacks pytest-xdist. `0` runs without xdist. A number sets it exactly and needs pytest-xdist.
     default: auto
-  coverage:
-    description: Measure line coverage (needs pytest-cov in the project; skipped with a notice when missing)
-    default: 'true'
   coverage-fail-under:
-    description: Fail when the line coverage is below this percentage. Empty never fails on coverage.
+    description: >
+      Fail when the line coverage is below this percentage. Empty never fails on coverage. Coverage is measured
+      when the project has pytest-cov, and skipped with a notice when it does not.
     default: ''
   min-passed:
     description: Fail when fewer tests passed, so a suite that silently stopped running is red. 0 disables it.
@@ -38,7 +37,6 @@ runs:
       env:
         PYTEST_ARGS: ${{ inputs.pytest-args }}
         WORKERS: ${{ inputs.workers }}
-        COVERAGE: ${{ inputs.coverage }}
         COV_FAIL_UNDER: ${{ inputs.coverage-fail-under }}
         MIN_PASSED: ${{ inputs.min-passed }}
       run: uv run --no-project --quiet python "$GITHUB_ACTION_PATH/run_pytest.py"

@@ -22,14 +22,12 @@ on:
         description: >
           pytest-xdist workers. `auto` is one per CPU of the job's cgroup quota, at most 8, and runs serially
           when the project lacks pytest-xdist. `0` runs without xdist. A number sets it exactly.
-      coverage:
-        type: boolean
-        default: true
-        description: Measure line coverage and report it in the job summary (needs pytest-cov in the project)
       coverage-fail-under:
         type: string
         default: ""
-        description: Fail when the line coverage is below this percentage, e.g. 85. Empty never fails on coverage.
+        description: >
+          Fail when the line coverage is below this percentage, e.g. 85. Empty never fails on coverage. Coverage is
+          measured when the project has pytest-cov, and shown in the job summary.
       uv-sync-args:
         type: string
         default: --frozen --all-extras
@@ -174,7 +172,6 @@ jobs:
         with:
           pytest-args: ${{ inputs.pytest-args }}
           workers: ${{ inputs.workers }}
-          coverage: ${{ inputs.coverage }}
           coverage-fail-under: ${{ inputs.coverage-fail-under }}
           min-passed: ${{ inputs.min-passed }}
 

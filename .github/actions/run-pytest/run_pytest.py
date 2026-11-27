@@ -45,13 +45,11 @@ def failed_ids(cache_dir):
     return sorted(json.loads(path.read_text())) if path.exists() else []
 
 
-def problems(rc, passed, failed, min_passed, coverage, fail_under):
+def problems(passed, failed, min_passed, coverage, fail_under):
     """Why the job must fail, as messages; empty means it passes."""
     found = []
     if passed < min_passed:
         found.append(f"only {passed} tests passed (expected at least {min_passed}) - the suite did not run")
-    elif passed == 0 and rc == 5:
-        found.append("no tests were selected")
     if failed:
         found.append(f"{len(failed)} test(s) fail on this branch")
     if fail_under is not None and coverage is None:
@@ -92,12 +90,11 @@ def main():
         print("::notice::pytest-xdist is not a dependency of this project: running serially")
         workers = 0
 
-    coverage = env["COVERAGE"] == "true"
-    if coverage and not installed("pytest_cov"):
+    coverage = installed("pytest_cov")
+    if not coverage:
         if fail_under is not None:
             sys.exit("::error::coverage-fail-under needs pytest-cov in the project's test dependencies")
         print("::notice::pytest-cov is not a dependency of this project: coverage is not measured")
-        coverage = False
 
     base = ["uv", "run", "--frozen", "pytest", *split_args(env["PYTEST_ARGS"]),
             "--continue-on-collection-errors", "-o", f"cache_dir={cache}"]
@@ -108,8 +105,8 @@ def main():
 
     rc, lines = run(cmd, run_env)
     (out / "head.log").write_text("".join(lines))
-    # 0 passed, 1 tests failed, 5 nothing selected. 2 (interrupted), 3 (internal) and 4 (usage) measured nothing.
-    if rc >= 2 and rc != 5:
+    # 0 passed, 1 tests failed. 2 interrupted, 3 internal error, 4 usage error, 5 no tests selected: nothing measured.
+    if rc >= 2:
         sys.exit(f"::error::pytest exited with {rc} before it could measure the suite")
     failed = failed_ids(cache)
     if rc == 1 and not failed:
@@ -126,8 +123,6 @@ def main():
         failed = still_failing
     for test in order_dependent:
         print(f"::warning::{test} failed in the parallel run and passed serially: it depends on what ran before it")
-    for test in failed:
-        print(f"FAILING: {test}")
 
     percent = None
     report = out / "coverage.json"
@@ -138,9 +133,9 @@ def main():
         fh.write(f"passed={passed}\n")
     with open(env.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as fh:
         fh.write(f"pytest: {passed} passed, {len(failed)} failed, {len(order_dependent)} order-dependent, "
-                 f"{workers} workers, coverage {f'{percent}%' if percent is not None else 'not measured'}\n")
+                 f"coverage {'n/a' if percent is None else f'{percent}%'}\n")
 
-    errors = problems(rc, passed, failed, int(env["MIN_PASSED"]), percent, fail_under)
+    errors = problems(passed, failed, int(env["MIN_PASSED"]), percent, fail_under)
     for message in errors:
         print(f"::error::{message}")
     return 1 if errors else 0

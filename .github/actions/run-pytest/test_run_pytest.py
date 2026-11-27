@@ -61,13 +61,12 @@ def test_failed_ids_without_a_cache(tmp_path):
     (dict(), []),
     (dict(failed=["a::t"]), ["1 test(s) fail on this branch"]),
     (dict(passed=5, min_passed=100), ["only 5 tests passed (expected at least 100) - the suite did not run"]),
-    (dict(passed=0, rc=5), ["no tests were selected"]),
-    (dict(passed=0, rc=5, min_passed=1), ["only 0 tests passed (expected at least 1) - the suite did not run"]),
+    (dict(passed=0, min_passed=1), ["only 0 tests passed (expected at least 1) - the suite did not run"]),
     (dict(coverage=75.0, fail_under=80.0), ["line coverage 75.0% is below the required 80.0%"]),
     (dict(coverage=75.0, fail_under=70.0), []),
     (dict(coverage=None, fail_under=70.0), ["coverage-fail-under is set but coverage was not measured"]),
     (dict(coverage=10.0), []),  # no floor set: coverage never fails the run
 ])
 def test_problems(kwargs, expected):
-    args = dict(rc=0, passed=41, failed=[], min_passed=0, coverage=None, fail_under=None)
+    args = dict(passed=41, failed=[], min_passed=0, coverage=None, fail_under=None)
     assert rp.problems(**{**args, **kwargs}) == expected

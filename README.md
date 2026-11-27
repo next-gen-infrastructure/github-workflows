@@ -186,16 +186,6 @@ jobs:
 `siblings`. No list of repos is kept in the workflow or the Dockerfile. There is no fallback to another
 branch: a main build never takes dev code.
 
-```yaml
-    with:
-      image-name: my-app
-      siblings-from-pyproject: true
-      sibling-files: |          # kept from each sibling; empty keeps everything except .git
-        src
-        pyproject.toml
-        README.md
-```
-
 ```dockerfile
 # An empty stub, so a plain local `docker build` still parses; the workflow replaces it.
 FROM scratch AS siblings
@@ -203,7 +193,8 @@ FROM scratch AS siblings
 FROM python:3.12-slim AS builder
 WORKDIR /app
 COPY . /app/
-COPY --from=siblings / /          # /<repo>/..., where the editable `../<repo>` paths point
+# /<repo>/..., where the editable `../<repo>` paths point
+COPY --from=siblings / /
 RUN uv sync --frozen
 
 FROM python:3.12-slim AS runtime
@@ -211,8 +202,7 @@ COPY --from=builder /app /app
 COPY --from=siblings / /
 ```
 
-The context stays out of `COPY . /app/`. For a local build with the same layout, pass
-`--build-context siblings=<dir>`; use `--no-cache` when switching between a build with and without it.
+The context stays out of `COPY . /app/`. For a local build, pass `--build-context siblings=<dir>`.
 
 **Build secret file (`BUILD_ENV_FILE`).** For an image that needs build-time settings from a `.env` file
 (for example a front-end image), store the whole `.env` as one secret named `BUILD_ENV_FILE` in a GitHub

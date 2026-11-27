@@ -34,7 +34,6 @@ repos:
       - id: run-pytest-test
         name: run-pytest unit tests
         language: system
-        # Bytecode and the pytest cache stay out of the tree.
-        entry: env PYTHONDONTWRITEBYTECODE=1 uv run --no-project --with pytest pytest -q -p no:cacheprovider .github/actions/run-pytest
+        entry: uv run --no-project --with pytest pytest -q .github/actions/run-pytest
         files: ^\.github/actions/run-pytest/
         pass_filenames: false

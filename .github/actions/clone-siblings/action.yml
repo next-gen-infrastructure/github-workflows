@@ -22,7 +22,9 @@ inputs:
     description: Of the siblings the project files name, only those starting with this. Empty takes them all. Listed repos are taken as written.
     default: ''
   sibling-repos:
-    description: Repos to clone as well, one per line (`#` starts a comment), for siblings the project files don't name.
+    description: >
+      Repos to clone as well, one per line (`#` starts a comment), for siblings the project files don't name.
+      A line may continue with the paths to stage for that repo (`name path path`), replacing stage-files for it.
     default: ''
   sibling-repos-file:
     description: Path in the checkout to a file of repos, one per line, merged with sibling-repos.

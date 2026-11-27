@@ -184,7 +184,8 @@ jobs:
 siblings its project files name (today the `../<name>` path dependencies in `[tool.uv.sources]` of a
 `pyproject.toml`, and each one's own), clones them at the build branch and passes them to the build as the
 named context `siblings`. Siblings the files don't name go in `sibling-repos` or `sibling-repos-file` (one
-per line, `#` comments); the lists add to what the files name. No repo list is kept in the Dockerfile. There is no fallback to another
+per line, `#` comments; `name path path` takes only those paths of that repo); the lists add to what the files
+name. No repo list is kept in the Dockerfile. There is no fallback to another
 branch: a main build never takes dev code. `sibling-files` keeps only the given paths of each sibling. The
 runner needs Python 3.11+, which the Ubuntu 24.04 images have.
 

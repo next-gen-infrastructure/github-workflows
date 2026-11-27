@@ -40,13 +40,19 @@ def sibling_names(repo_dir, prefix):
 
 
 def listed_repos(text):
-    """Repo names from an explicit list: one per line, `#` starts a comment, blank lines ignored."""
-    names = [line.split("#")[0].strip() for line in text.splitlines()]
-    names = [name for name in names if name]
-    for name in names:
-        if not re.fullmatch(NAME, name):
-            sys.exit(f"::error::refusing sibling repo {name!r}")
-    return sorted(set(names))
+    """An explicit list as {repo: paths}: one repo per line, optionally followed by the paths to stage for it.
+
+    `#` starts a comment, blank lines are ignored, and a repo listed twice keeps its last line.
+    """
+    listed = {}
+    for line in text.splitlines():
+        words = line.split("#")[0].split()
+        if not words:
+            continue
+        if not re.fullmatch(NAME, words[0]):
+            sys.exit(f"::error::refusing sibling repo {words[0]!r}")
+        listed[words[0]] = words[1:]
+    return listed
 
 
 def clone(repo, parent, owner, ref, fallback_ref, git=subprocess.run):
@@ -82,14 +88,18 @@ def clone_closure(workspace, prefix, clone_one, listed=()):
             frontier = sorted({n for repo in todo for n in sibling_names(parent / repo, prefix)})
 
 
-def stage(repos, parent, dest, files):
-    """Copy each repo's `files` (all but .git when empty) to dest/<repo>, the layout `COPY --from=<ctx> / /` wants."""
+def stage(repos, parent, dest, files, per_repo=None):
+    """Copy each repo's `files` (all but .git when empty) to dest/<repo>, the layout `COPY --from=<ctx> / /` wants.
+
+    `per_repo` {repo: paths} replaces `files` for the repos it names.
+    """
     shutil.rmtree(dest, ignore_errors=True)
     for repo in repos:
-        if not files:
+        paths = (per_repo or {}).get(repo) or files
+        if not paths:
             shutil.copytree(parent / repo, dest / repo, ignore=shutil.ignore_patterns(".git"))
             continue
-        for name in files:
+        for name in paths:
             path = pathlib.PurePath(name)
             if path.is_absolute() or ".." in path.parts:
                 sys.exit(f"::error::refusing sibling-files entry {name}")
@@ -120,20 +130,21 @@ def main():
     def clone_one(repo):
         clone(repo, parent, env["OWNER"], env["BASE_REF"], fallback_ref)
 
-    listed = env.get("SIBLING_REPOS", "")
+    listed_text = env.get("SIBLING_REPOS", "")
     if env.get("SIBLING_REPOS_FILE"):
         repos_file = workspace / env["SIBLING_REPOS_FILE"]
         if not repos_file.is_file():
             sys.exit(f"::error::sibling-repos-file {env['SIBLING_REPOS_FILE']} not found")
-        listed += "\n" + repos_file.read_text()
-    cloned = clone_closure(workspace, prefix, clone_one, listed_repos(listed))
+        listed_text += "\n" + repos_file.read_text()
+    listed = listed_repos(listed_text)
+    cloned = clone_closure(workspace, prefix, clone_one, listed)
     with open(env["GITHUB_OUTPUT"], "a") as fh:
         fh.write(f"repos={' '.join(cloned)}\n")
 
     if env.get("STAGE_DIR"):
         if not cloned:
             sys.exit("::error::no sibling repositories found to stage")
-        stage(cloned, parent, pathlib.Path(env["STAGE_DIR"]), env["STAGE_FILES"].split())
+        stage(cloned, parent, pathlib.Path(env["STAGE_DIR"]), env["STAGE_FILES"].split(), listed)
         if source in cloned:  # a dispatch from a dependency: its commit goes into the image tag
             sha = subprocess.check_output(["git", "-C", str(parent / source), "rev-parse", "--short", "HEAD"], text=True)
             with open(env["GITHUB_ENV"], "a") as fh:

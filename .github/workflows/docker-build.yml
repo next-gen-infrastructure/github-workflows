@@ -46,10 +46,6 @@ on:
           until nothing new appears), clone them at the build branch, and pass them to the build as the
           named context `siblings`. The Dockerfile takes them with `COPY --from=siblings / /`, so no list of
           repos is kept anywhere. There is no fallback to another branch.
-      sibling-prefix:
-        type: string
-        default: ""
-        description: With siblings-from-pyproject, only path dependencies named `../<prefix>*`. Empty takes every one.
       sibling-files:
         type: string
         default: ""
@@ -243,7 +239,6 @@ jobs:
           token: ${{ steps.deps-token.outputs.token }}
           base-ref: ${{ steps.target.outputs.branch }}
           fallback-ref: ""
-          sibling-prefix: ${{ inputs.sibling-prefix }}
 
       # The named context holds /<repo>/<files>, so `COPY --from=siblings / /` puts each at /<repo>, where the
       # editable path dependencies (`../<repo>` from /app) point. It stays out of `COPY . /app/`.
@@ -260,29 +255,16 @@ jobs:
             printf '::error::refusing source_repo %q\n' "$SOURCE"; exit 1
           fi
           [ -n "$REPOS" ] || { echo "::error::pyproject.toml names no sibling repositories"; exit 1; }
-          files=()
           set -f  # a pattern in sibling-files is a name, not a glob
-          for f in $FILES; do
-            if [[ ! "$f" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "$f" == *..* ]]; then
-              printf '::error::refusing sibling-files entry %q\n' "$f"; exit 1
-            fi
-            files+=("$f")
-          done
-          set +f
           dest="$RUNNER_TEMP/siblings"
           rm -rf "$dest"
           mkdir -p "$dest"
           for repo in $REPOS; do
             src="$WORKSPACE/../$repo"
             mkdir "$dest/$repo"
-            if [ ${#files[@]} -eq 0 ]; then
-              tar -C "$src" --exclude=.git -cf - . | tar -C "$dest/$repo" -xf -
-            else
-              for f in "${files[@]}"; do
-                [ -e "$src/$f" ] || { printf '::error::%s has no %s\n' "$repo" "$f"; exit 1; }
-              done
-              tar -C "$src" -cf - "${files[@]}" | tar -C "$dest/$repo" -xf -
-            fi
+            # tar fails the step on a path the sibling lacks; empty FILES takes everything but .git
+            # shellcheck disable=SC2086  # FILES is a list of names, split on purpose (globbing is off)
+            tar -C "$src" --exclude=.git -cf - ${FILES:-.} | tar -C "$dest/$repo" -xf -
             if [ "$repo" = "$SOURCE" ]; then
               echo "SUBMODULE_SHA=-$(git -C "$src" rev-parse --short HEAD)" >> "$GITHUB_ENV"
             fi

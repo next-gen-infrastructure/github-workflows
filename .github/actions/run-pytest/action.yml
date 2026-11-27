@@ -1,8 +1,8 @@
 name: Run pytest
 description: >
   Run the suite with `uv run pytest` after `uv sync`: parallel with pytest-xdist, failures re-run serially to
-  tell real ones from order-dependent ones, coverage measured, a summary written. The token never reaches
-  pytest. Reports are left in $RUNNER_TEMP/pytest.
+  tell real ones from order-dependent ones, coverage measured. The logic is in run_pytest.py next to this file.
+  Reports are left in $RUNNER_TEMP/pytest.
 
 inputs:
   pytest-args:
@@ -12,55 +12,23 @@ inputs:
     default: tests
   workers:
     description: >
-      pytest-xdist workers. `auto` is one per CPU of the cgroup quota (the host's nproc when there is none),
-      at most 8. `0` runs without xdist. A number sets it exactly.
+      pytest-xdist workers. `auto` is one per CPU of the cgroup quota, at most 8, and runs serially when the
+      project lacks pytest-xdist. `0` runs without xdist. A number sets it exactly and needs pytest-xdist.
     default: auto
-  rerun-failures-serially:
-    description: >
-      Re-run the tests that failed in the parallel run, serially. Only those that fail again fail the run.
-      The ones that pass are order-dependent: listed as a warning.
-    default: 'true'
-  fail-on-order-dependent:
-    description: Fail the run on order-dependent tests too
-    default: 'false'
   coverage:
-    description: Measure line coverage (pytest-cov, added with `uv run --with` when the project lacks it)
+    description: Measure line coverage (needs pytest-cov in the project; skipped with a notice when missing)
     default: 'true'
-  coverage-source:
-    description: >
-      What to measure, one `--cov` source per line or separated by spaces. Empty uses the project's own
-      `[tool.coverage.run] source`.
-    default: ''
   coverage-fail-under:
     description: Fail when the line coverage is below this percentage. Empty never fails on coverage.
     default: ''
-  durations:
-    description: List this many slowest tests in the log. 0 turns it off.
-    default: '20'
   min-passed:
     description: Fail when fewer tests passed, so a suite that silently stopped running is red. 0 disables it.
     default: '0'
-  compare-with-base:
-    description: >
-      Pull requests only: also run the target branch and fail only on tests that fail here and pass there.
-    default: 'false'
-  base-ref:
-    description: Target branch for compare-with-base
-    default: ''
-  uv-sync-args:
-    description: Arguments for the `uv sync` that compare-with-base runs on each branch
-    default: --frozen --all-extras
-  token:
-    description: Token for the private git sources of `uv sync` in compare-with-base. Never passed to pytest.
-    default: ''
 
 outputs:
   passed:
     description: Number of tests that passed on this branch
     value: ${{ steps.pytest.outputs.passed }}
-  coverage:
-    description: Line coverage in percent, empty when not measured
-    value: ${{ steps.pytest.outputs.coverage }}
 
 runs:
   using: composite
@@ -70,248 +38,7 @@ runs:
       env:
         PYTEST_ARGS: ${{ inputs.pytest-args }}
         WORKERS: ${{ inputs.workers }}
-        RERUN: ${{ inputs.rerun-failures-serially }}
-        FAIL_ON_OD: ${{ inputs.fail-on-order-dependent }}
         COVERAGE: ${{ inputs.coverage }}
-        COV_SOURCE: ${{ inputs.coverage-source }}
         COV_FAIL_UNDER: ${{ inputs.coverage-fail-under }}
-        DURATIONS: ${{ inputs.durations }}
         MIN_PASSED: ${{ inputs.min-passed }}
-        COMPARE: ${{ inputs.compare-with-base == 'true' && github.event_name == 'pull_request' }}
-        BASE_REF: ${{ inputs.base-ref }}
-        UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
-        # Private git sources, for the `uv sync` of compare-with-base only.
-        GH_TOKEN: ${{ inputs.token }}
-        GIT_CONFIG_COUNT: 1
-        GIT_CONFIG_KEY_0: credential.https://github.com.helper
-        GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
-      run: |
-        set -uo pipefail
-
-        fail() { echo "::error::$*"; exit 1; }
-        is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
-        is_number "$DURATIONS" || fail "durations must be a number, got '$DURATIONS'"
-        is_number "$MIN_PASSED" || fail "min-passed must be a number, got '$MIN_PASSED'"
-        [[ -z "$COV_FAIL_UNDER" || "$COV_FAIL_UNDER" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
-          || fail "coverage-fail-under must be a number, got '$COV_FAIL_UNDER'"
-
-        # One argument per line when the value has a newline, else split on spaces.
-        split_args() {
-          if [[ "$1" == *$'\n'* ]]; then
-            while IFS= read -r line; do
-              if [ -n "$line" ]; then printf '%s\0' "$line"; fi
-            done <<<"$1"
-          else
-            # No globbing: `tests/*` reaches pytest as written.
-            (set -f; for word in $1; do printf '%s\0' "$word"; done)
-          fi
-        }
-        pytest_args=()
-        while IFS= read -r -d '' word; do pytest_args+=("$word"); done < <(split_args "$PYTEST_ARGS")
-        cov_sources=()
-        while IFS= read -r -d '' word; do cov_sources+=("$word"); done < <(split_args "$COV_SOURCE")
-        sync_args=()
-        while IFS= read -r -d '' word; do sync_args+=("$word"); done < <(split_args "$UV_SYNC_ARGS")
-
-        # xdist workers: one per CPU of the cgroup quota. `nproc` reports the host, not what the job may use.
-        case "$WORKERS" in
-          auto)
-            cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-            if read -r quota period 2>/dev/null < /sys/fs/cgroup/cpu.max && [ "$quota" != "max" ]; then
-              cpus=$(( (quota + period - 1) / period ))
-            fi
-            workers=$cpus
-            [ "$workers" -gt 8 ] && workers=8
-            [ "$workers" -lt 1 ] && workers=1
-            ;;
-          *) is_number "$WORKERS" || fail "workers must be auto or a number, got '$WORKERS'"; workers=$WORKERS ;;
-        esac
-
-        # pytest runs the repository's code and its dependencies: keep the token out of its environment.
-        no_token=(env -u GH_TOKEN -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0)
-        out="$RUNNER_TEMP/pytest"
-        rm -rf "$out"
-        mkdir -p "$out"
-
-        # Plugins the project does not declare come in for this run only.
-        with=()
-        if [ "$workers" -gt 0 ] && ! uv run --frozen --no-sync python -c 'import xdist' 2>/dev/null; then
-          echo "pytest-xdist is not a dependency of this project; adding it for this run"
-          with+=(--with pytest-xdist)
-        fi
-        if [ "$COVERAGE" = "true" ] && ! uv run --frozen --no-sync python -c 'import pytest_cov' 2>/dev/null; then
-          echo "pytest-cov is not a dependency of this project; adding it for this run"
-          with+=(--with pytest-cov)
-        fi
-
-        par=()
-        [ "$workers" -gt 0 ] && par=(-n "$workers")
-        timing=()
-        [ "$DURATIONS" -gt 0 ] && timing=("--durations=$DURATIONS" --durations-min=1.0)
-        cov=()
-        if [ "$COVERAGE" = "true" ]; then
-          export COVERAGE_FILE="$out/.coverage"
-          # sys.monitoring measures the same lines as the default tracer at a fraction of its cost.
-          if uv run --frozen --no-sync python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
-            export COVERAGE_CORE=sysmon
-          fi
-          if [ ${#cov_sources[@]} -gt 0 ]; then
-            for src in "${cov_sources[@]}"; do cov+=("--cov=$src"); done
-          else
-            cov+=(--cov)
-          fi
-          cov+=(--cov-report= "--cov-report=json:$out/coverage.json" "--cov-report=xml:$out/coverage.xml")
-        fi
-
-        # The ids come from pytest's own cache, so they are exact: a parametrised id with a space or a
-        # non-ASCII character is not cut the way `grep FAILED | cut` cuts it.
-        read_failed() {
-          uv run --no-project --quiet python - "$out/cache-$1/v/cache/lastfailed" <<'PY'
-        import json, pathlib, sys
-        p = pathlib.Path(sys.argv[1])
-        ids = sorted(json.loads(p.read_text())) if p.exists() else []
-        print("".join(f"{i}\n" for i in ids), end="")
-        PY
-        }
-
-        # Passed = test cases with no failure, error or skip. A missing file (pytest died before writing it) is 0.
-        passed_in() {
-          if [ ! -f "$1" ]; then echo 0; return; fi
-          uv run --no-project --quiet python - "$1" <<'PY'
-        import sys
-        import xml.etree.ElementTree as ET
-
-        passed = 0
-        for case in ET.parse(sys.argv[1]).getroot().iter("testcase"):
-            if case.find("failure") is None and case.find("error") is None and case.find("skipped") is None:
-                passed += 1
-        print(passed)
-        PY
-        }
-
-        run_pytest() {  # label, then extra pytest args
-          local label="$1"; shift
-          rm -rf "$out/cache-$label"
-          "${no_token[@]}" uv run --frozen ${with[@]+"${with[@]}"} pytest "${pytest_args[@]}" \
-            --continue-on-collection-errors -o "cache_dir=$out/cache-$label" --junitxml="$out/$label.xml" "$@"
-        }
-
-        if [ "$COMPARE" = "true" ]; then
-          [ -n "$BASE_REF" ] || fail "compare-with-base needs base-ref"
-          head_sha=$(git rev-parse HEAD)
-          git checkout -qf "origin/$BASE_REF"
-          uv sync "${sync_args[@]}"
-          run_pytest base ${par[@]+"${par[@]}"} > "$out/base.log" 2>&1 || true
-          read_failed base > "$out/base_failed.txt"
-          echo "target branch: $(grep -c . "$out/base_failed.txt" || true) failing, $(passed_in "$out/base.xml") passing tests"
-          git checkout -qf "$head_sha"
-          uv sync "${sync_args[@]}"
-        fi
-
-        run_pytest head ${par[@]+"${par[@]}"} ${timing[@]+"${timing[@]}"} ${cov[@]+"${cov[@]}"} 2>&1 | tee "$out/head.log"
-        rc=${PIPESTATUS[0]}
-
-        # 0 passed, 1 tests failed, 5 nothing selected. 2 (interrupted), 3 (internal error) and 4 (usage
-        # error) mean pytest measured nothing, and an empty failure list would then read as "nothing fails".
-        if [ "$rc" -ge 2 ] && [ "$rc" -ne 5 ]; then
-          tail -40 "$out/head.log"
-          fail "pytest exited with $rc before it could measure the suite"
-        fi
-
-        passed=$(passed_in "$out/head.xml")
-        echo "passed=$passed" >> "$GITHUB_OUTPUT"
-        read_failed head > "$out/parallel_failed.txt"
-        if [ "$rc" -eq 1 ] && [ ! -s "$out/parallel_failed.txt" ]; then
-          fail "pytest reported failures but none could be identified from its cache"
-        fi
-
-        # xdist decides which worker runs what, so a test that fails only because of the order or the worker it
-        # landed on shows up in one run and not the next. Re-run the failures serially, keep those that fail again.
-        cp "$out/parallel_failed.txt" "$out/failed.txt"
-        if [ "$RERUN" = "true" ] && [ -s "$out/parallel_failed.txt" ]; then
-          echo "Re-running $(grep -c . "$out/parallel_failed.txt") failed test(s) serially"
-          "${no_token[@]}" uv run --frozen ${with[@]+"${with[@]}"} pytest "${pytest_args[@]}" \
-            --continue-on-collection-errors -o "cache_dir=$out/cache-head" --junitxml="$out/rerun.xml" \
-            --lf --lfnf=none -n 0 > "$out/rerun.log" 2>&1 || true
-          read_failed head > "$out/failed.txt"
-        fi
-        # C collation, to match Python's sorted().
-        LC_ALL=C comm -23 "$out/parallel_failed.txt" "$out/failed.txt" > "$out/order_dependent.txt"
-
-        coverage_pct=""
-        if [ -f "$out/coverage.json" ]; then
-          coverage_pct=$(uv run --no-project --quiet python - "$out/coverage.json" <<'PY'
-        import json, sys
-        print(f"{json.load(open(sys.argv[1]))['totals']['percent_covered']:.2f}")
-        PY
-          )
-        fi
-        echo "coverage=$coverage_pct" >> "$GITHUB_OUTPUT"
-
-        status=0
-        problems=()
-        if [ "$passed" -lt "$MIN_PASSED" ]; then
-          problems+=("only $passed tests passed (expected at least $MIN_PASSED) - the suite did not run")
-        elif [ "$passed" -eq 0 ] && [ "$rc" -eq 5 ]; then
-          problems+=("no tests were selected")
-        fi
-        if [ "$COMPARE" = "true" ]; then
-          LC_ALL=C comm -23 "$out/failed.txt" "$out/base_failed.txt" > "$out/new_failures.txt"
-          LC_ALL=C comm -13 "$out/failed.txt" "$out/base_failed.txt" > "$out/fixed.txt"
-          new_n=$(grep -c . "$out/new_failures.txt" || true)
-          echo "::notice::$new_n newly failing, $(grep -c . "$out/fixed.txt" || true) newly passing, against $BASE_REF measured in this run"
-          if [ "$new_n" -gt 0 ]; then
-            echo "newly FAILING (broken by this PR):"; cat "$out/new_failures.txt"
-            problems+=("$new_n test(s) fail on this branch and pass on $BASE_REF")
-          fi
-        elif [ -s "$out/failed.txt" ]; then
-          echo "FAILING:"; cat "$out/failed.txt"
-          problems+=("$(grep -c . "$out/failed.txt") test(s) fail on this branch")
-        fi
-        if [ -s "$out/order_dependent.txt" ]; then
-          echo "failed in the parallel run, passed when re-run serially (order-dependent):"
-          cat "$out/order_dependent.txt"
-          od_n=$(grep -c . "$out/order_dependent.txt")
-          if [ "$FAIL_ON_OD" = "true" ]; then
-            problems+=("$od_n order-dependent test(s)")
-          else
-            echo "::warning::$od_n test(s) fail only in the parallel run - they depend on what ran before them"
-          fi
-        fi
-        if [ -n "$COV_FAIL_UNDER" ]; then
-          if [ -z "$coverage_pct" ]; then
-            problems+=("coverage-fail-under is set but coverage was not measured")
-          elif ! awk -v c="$coverage_pct" -v m="$COV_FAIL_UNDER" 'BEGIN { exit !(c + 0 >= m + 0) }'; then
-            problems+=("line coverage $coverage_pct% is below the required $COV_FAIL_UNDER%")
-          fi
-        fi
-
-        {
-          echo "### pytest"
-          echo
-          echo "| | |"
-          echo "|---|---|"
-          echo "| passed | $passed |"
-          echo "| failed | $(grep -c . "$out/failed.txt" || true) |"
-          echo "| order-dependent | $(grep -c . "$out/order_dependent.txt" || true) |"
-          echo "| xdist workers | $workers |"
-          if [ -n "$coverage_pct" ]; then
-            echo "| line coverage | $coverage_pct% |"
-          else
-            echo "| line coverage | not measured |"
-          fi
-          if [ -s "$out/order_dependent.txt" ]; then
-            echo; echo "Order-dependent (failed in parallel, passed serially):"; echo
-            sed 's/^/- `/; s/$/`/' "$out/order_dependent.txt"
-          fi
-          if [ -s "$out/failed.txt" ]; then
-            echo; echo "Failing:"; echo
-            sed 's/^/- `/; s/$/`/' "$out/failed.txt"
-          fi
-        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-        if [ ${#problems[@]} -gt 0 ]; then
-          for problem in "${problems[@]}"; do echo "::error::$problem"; done
-          status=1
-        fi
-        exit "$status"
+      run: uv run --no-project --quiet python "$GITHUB_ACTION_PATH/run_pytest.py"
